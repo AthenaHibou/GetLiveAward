@@ -724,7 +724,8 @@ class UiTests(unittest.TestCase):
         login.assert_called_once()
         claim.assert_not_called()
         self.assertNotEqual(window.service.account_id, "default")
-        self.assertEqual(window.account_combo.currentText(), "账号二")
+        self.assertEqual(window.account_combo.currentText(), "账号二（待登录）")
+        self.assertEqual(window.login_status.text(), "账号待登录")
         self.assertIsNone(load_cookie_file(window.service.paths.cookie_file))
         self.assertEqual(
             load_cookie_file(self.service.paths.cookie_file)["SESSDATA"], "original"
@@ -1029,10 +1030,35 @@ class UiTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertIsNone(window.worker_thread)
             self.assertEqual(window.login_status.text(), "登录已验证")
+            self.assertEqual(window.login_btn.text(), "检查登录")
+            self.assertEqual(window.batch_status.text(), window.STATUS_IDLE)
+            self.assertIn("账号已就绪", window.flow_hint.text())
             self.assertTrue(window.start_btn.isEnabled())
             login.assert_called_once()
             claim.assert_not_called()
         window.close()
+
+    def test_login_ui_copy_tracks_current_account_verification(self):
+        window = MainWindow(self.service)
+        self.addCleanup(window.close)
+        self.assertEqual(window.login_btn.text(), "登录当前账号")
+        self.assertIn("登录当前账号后", window.product_hint.text())
+        window._on_login_checked(True, "登录已验证")
+        self.assertEqual(window.login_btn.text(), "检查登录")
+        self.assertIn("等待奖励开放", window.product_hint.text())
+        self.assertIn("账号已就绪", window.flow_hint.text())
+        window._on_login_checked(False, "登录已取消")
+        self.assertEqual(window.login_btn.text(), "登录当前账号")
+        self.assertIn("登录当前账号", window.flow_hint.text())
+
+    def test_tutorial_account_step_matches_verified_state(self):
+        window = MainWindow(self.service)
+        self.addCleanup(window.close)
+        window._on_login_checked(True, "登录已验证")
+        window.show_tutorial()
+        step = window.guide.steps[1]
+        self.assertEqual(step[1], "确认当前账号")
+        self.assertIn("当前账号已验证", step[2])
 
     def test_window_close_cancels_login_without_leaving_thread(self):
         window = MainWindow(self.service)
@@ -1056,7 +1082,7 @@ class UiTests(unittest.TestCase):
     def test_window_reads_current_theme_scale(self):
         with patch("ui.theme.SCALE", 1.5):
             window = MainWindow(self.service)
-            self.assertEqual(window.link_rows[0].index_label.width(), 102)
+            self.assertEqual(window.link_rows[0].index_label.width(), 42)
             window.close()
 
     def test_batch_concurrency_is_bounded(self):

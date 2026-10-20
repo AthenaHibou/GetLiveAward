@@ -51,6 +51,7 @@ class ClaimOptions:
 
 @dataclass(frozen=True, slots=True)
 class RunSettings:
+    global_interval_ms: int = 1000
     concurrent: bool = False
     request_workers: int = 2
     parallel_links: bool = False
@@ -75,6 +76,8 @@ class RunSettings:
             raise ValueError("并发数必须在 1 到 4 之间")
         if not 100 <= self.interval_ms <= 60000:
             raise ValueError("请求间隔必须在 100 到 60000 ms 之间")
+        if not 100 <= self.global_interval_ms <= 60000:
+            raise ValueError("全局最小间隔必须在 100 到 60000 ms 之间")
         if self.retry_mode not in ("count", "duration", "continuous", "scheduled"):
             raise ValueError("执行方式无效")
         if self.scheduled_retry_mode not in ("count", "duration", "continuous"):
@@ -158,6 +161,7 @@ class LinkTaskItem:
     index: int
     task_url: str
     task_id: str
+    settings: RunSettings | None = None
 
 
 @dataclass(slots=True)
@@ -200,6 +204,29 @@ class RuntimePaths:
     log_file: str
 
 
+class ClaimRetryBudget:
+    """Keep each worker's attempt count across a cookie refresh."""
+
+    def __init__(self, limit: int | None, workers: int = 1) -> None:
+        self.limit = limit
+        self.workers = workers
+        self._counts: dict[int, int] = {}
+        self._lock = threading.Lock()
+
+    def reserve(self, worker_id: int) -> int | None:
+        with self._lock:
+            used = self._counts.get(worker_id, 0)
+            if self.limit is not None and used >= self.limit:
+                return None
+            self._counts[worker_id] = used + 1
+            return used + 1
+
+    def has_remaining(self, worker_id: int | None = None) -> bool:
+        with self._lock:
+            workers = range(1, self.workers + 1) if worker_id is None else (worker_id,)
+            return self.limit is None or any(self._counts.get(item, 0) < self.limit for item in workers)
+
+
 class ClaimExecutionControl:
     def __init__(self) -> None:
         self._cancel_event = threading.Event()
@@ -236,11 +263,14 @@ class ClaimExecutionControl:
         *,
         stop_event: threading.Event | None = None,
         deadline: float | None = None,
+        check_callback: Callable[[], None] | None = None,
     ) -> None:
         while self.is_paused():
             if stop_event is not None and stop_event.is_set():
                 return
             self.check_cancelled()
+            if check_callback is not None:
+                check_callback()
             if deadline is not None and time.monotonic() >= deadline:
                 raise BiliRewardTimeoutError("[任务] 已达到执行时长，停止该链接")
             self._resume_event.wait(timeout=poll_interval)

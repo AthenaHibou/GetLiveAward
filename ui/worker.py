@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -20,6 +21,7 @@ from core.models import (
 )
 from core.service import RewardService
 from core.clock_sync import BEIJING, next_scheduled_time
+from core.task_config import with_globals
 
 
 class ClaimWorker(QObject):
@@ -55,6 +57,7 @@ class ClaimWorker(QObject):
             and all(control.is_cancelled() for control in self._claim_controls.values())
         ):
             raise BiliRewardCancelledError("[定时] 已取消等待")
+        self.service.check_batch_active()
 
     def _sync_clock(self, timeout: float = 2.0) -> None:
         self._check_wait_cancelled()
@@ -64,13 +67,15 @@ class ClaimWorker(QObject):
         self._emit_batch_log(f"[校时] {self.settings.time_server}: {message}")
 
     def _wait_scheduled(
-        self, target: float, prepared: dict[int, PreparedLinkTask]
+        self, target: float, prepared: dict[int, PreparedLinkTask],
+        task_settings: RunSettings | None = None,
     ) -> None:
+        timing = task_settings or self.settings
         formatted = datetime.fromtimestamp(target, BEIJING).strftime(
             "%Y-%m-%d %H:%M:%S.%f"
         )[:-3]
         self._emit_batch_log(
-            f"[定时] 首发目标 {formatted}（北京时间）；后续执行方式 {self.settings.effective_retry_mode}"
+            f"[定时] 首发目标 {formatted}（北京时间）；后续执行方式 {timing.effective_retry_mode}"
         )
         self.status_changed.emit("定时等待中")
         for index in prepared:
@@ -80,10 +85,12 @@ class ClaimWorker(QObject):
         warmed = False
         last_remaining = None
         lead = max(
-            20.0, self.settings.timeout * 2 + self.settings.interval * len(prepared)
+            20.0, timing.timeout * 2 + timing.interval * len(prepared)
         )
         while True:
             self._check_wait_cancelled()
+            if prepared and all(self._claim_controls[index].is_cancelled() for index in prepared):
+                raise BiliRewardCancelledError("[定时] 已取消该任务等待")
             remaining = target - self.service.clock.now()
             if self.service.clock.age() > max(
                 120, self.settings.sync_interval_seconds * 2 + 2
@@ -207,7 +214,7 @@ class ClaimWorker(QObject):
         )
         prepared = self.service.prepare_link_task(
             link_task,
-            options=self.settings.claim_options(link_task.task_id),
+            options=with_globals(link_task.settings or self.settings, self.settings).claim_options(link_task.task_id),
             log_callback=self.log_message.emit,
             qr_callback=lambda qr_data, idx=link_task.index: self.qr_code_ready.emit(
                 idx, qr_data
@@ -282,6 +289,47 @@ class ClaimWorker(QObject):
             return "已取消"
         return "失败"
 
+    def _run_task_queue(self) -> list[SingleLinkClaimResult]:
+        """One shared account/limiter; each task keeps its own immutable options."""
+        settings = {task.index: with_globals(task.settings or self.settings, self.settings)
+                    for task in self.link_tasks}
+        if any(item.sync_required for item in settings.values()):
+            self._sync_clock()
+        now = self.service.clock.now()
+        targets = {task.index: next_scheduled_time(now, settings[task.index].scheduled_time,
+                                                  settings[task.index].start_delay_ms)
+                   for task in self.link_tasks if settings[task.index].retry_mode == "scheduled"}
+        tasks = sorted(self.link_tasks, key=lambda task: targets.get(task.index, now))
+        for task in tasks:
+            self.link_status_changed.emit(task.index, "排队中")
+            if task.index in targets:
+                target_text = datetime.fromtimestamp(targets[task.index], BEIJING).strftime("%m-%d %H:%M:%S.%f")[:-3]
+                self._emit_link_log(task.index, f"[定时] 本次目标 {target_text}（北京时间）")
+        self._emit_batch_log("任务独立设置；立即任务优先，定时任务按本次目标排序。同一时刻默认串行，前一条未结束会推迟后续任务。")
+
+        def execute(task):
+            try:
+                self._check_wait_cancelled()
+                self._claim_controls[task.index].check_cancelled()
+                ready = self._prepare_link_task(task)
+                target = targets.get(task.index)
+                if target is not None:
+                    self._wait_scheduled(target, {task.index: ready}, settings[task.index])
+                self._claim_controls[task.index].check_cancelled()
+                return self._claim_prepared_task(ready)
+            except Exception as exc:
+                cancelled = isinstance(exc, (BiliRewardCancelledError, LoginCancelledError))
+                status = "cancelled" if cancelled else "failed"
+                self._emit_link_log(task.index, f"[任务] {'取消' if cancelled else '失败'}: {exc}")
+                self.link_status_changed.emit(task.index, "已取消" if cancelled else "失败")
+                return SingleLinkClaimResult(task.index, task.task_id, status, error=str(exc))
+
+        if self.settings.active_links == 1:
+            return [execute(task) for task in tasks]
+        with ThreadPoolExecutor(max_workers=min(self.settings.active_links, len(tasks))) as executor:
+            futures = [executor.submit(execute, task) for task in tasks]
+            return [future.result() for future in as_completed(futures)]
+
     @pyqtSlot()
     def run(self) -> None:
         self.status_changed.emit("运行中")
@@ -314,7 +362,12 @@ class ClaimWorker(QObject):
                 )
 
         try:
-            self.service.configure(self.settings)
+            individual = any(task.settings is not None for task in self.link_tasks)
+            self.service.configure(replace(self.settings, interval_ms=self.settings.global_interval_ms)
+                                   if individual else self.settings)
+            if individual and self.link_tasks:
+                results.extend(self._run_task_queue())
+                return
             target = None
             if self.settings.sync_required:
                 self._sync_clock()
@@ -421,9 +474,9 @@ class LoginWorker(ClaimWorker):
     def run(self) -> None:
         self.status_changed.emit("检查登录中")
         try:
-            self.service.configure(self.settings)
-            if self.settings.sync_required:
-                self._sync_clock()
+            # Authentication must work even when the scheduled task's NTP server is down.
+            self.service.configure(replace(self.settings, interval_ms=self.settings.global_interval_ms,
+                                           retry_mode="count", time_sync_enabled=False))
             self.service.ensure_login(
                 log_callback=self.log_message.emit,
                 qr_callback=lambda qr: self.qr_code_ready.emit(-1, qr),

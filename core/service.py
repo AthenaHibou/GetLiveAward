@@ -15,6 +15,7 @@ from .models import (
     AwardInfo,
     ClaimExecutionControl,
     ClaimOptions,
+    ClaimRetryBudget,
     ClaimResult,
     LinkTaskItem,
     OptionalCancelCheck,
@@ -42,7 +43,7 @@ class RewardService:
         self.paths = get_runtime_paths(base_dir, account_id)
         ensure_runtime_dirs(self.paths)
         self._login_lock = threading.Lock()
-        self._clients: dict[float, BiliRewardClient] = {}
+        self._clients: dict[tuple[float, float], BiliRewardClient] = {}
         self._all_clients: list[BiliRewardClient] = []
         self._cookie_text: str | None = None
         self._limiter = RequestLimiter()
@@ -73,6 +74,9 @@ class RewardService:
         self._loggers.append(logger)
         return logger
 
+    def check_batch_active(self) -> None:
+        self._limiter.check_blocked()
+
     def ensure_login(
         self,
         *,
@@ -100,22 +104,23 @@ class RewardService:
 
     def _client(self, options, logger, qr_callback, cancel_check, *, stale=None):
         with self._login_guard(cancel_check):
+            client_key = (options.timeout, options.retry_interval)
             # A concurrent task may already have replaced this stale login generation.
             refresh = stale is not None and stale in self._clients.values()
             if refresh:
                 self._clients.clear()
                 self._cookie_text = None
-            if options.timeout in self._clients:
-                return self._clients[options.timeout]
+            if client_key in self._clients:
+                return self._clients[client_key]
             if not refresh and self._cookie_text is None:
                 cookies = load_cookie_file(self.paths.cookie_file)
                 self._cookie_text = format_cookies_text(cookies) if cookies else None
             if self._cookie_text is not None:
                 client = self._new_client(options)
                 try:
-                    self.account_identity = client.ensure_logged_in() or {}
+                    self.account_identity = client.ensure_logged_in(cancel_check=cancel_check) or {}
                     logger.log("[Cookie] 登录状态验证通过")
-                    self._clients[options.timeout] = client
+                    self._clients[client_key] = client
                     return client
                 except BiliCookieInvalidError:
                     self._cookie_text = None
@@ -130,8 +135,8 @@ class RewardService:
             save_cookie_file(self.paths.cookie_file, cookies)
             self._cookie_text = format_cookies_text(cookies)
             client = self._new_client(options)
-            self.account_identity = client.ensure_logged_in() or {}
-            self._clients[options.timeout] = client
+            self.account_identity = client.ensure_logged_in(cancel_check=cancel_check) or {}
+            self._clients[client_key] = client
             return client
 
     def _new_client(self, options):
@@ -140,6 +145,7 @@ class RewardService:
             timeout=options.timeout,
             limiter=self._limiter,
             wall_time=self.clock.now,
+            request_interval=options.retry_interval,
         )
         self._all_clients.append(client)
         return client
@@ -166,7 +172,7 @@ class RewardService:
     ) -> None:
         BiliRewardClient._check_cancel(cancel_check)
         try:
-            task.client.ensure_logged_in()
+            self.account_identity = task.client.ensure_logged_in(cancel_check=cancel_check) or {}
         except BiliCookieInvalidError:
             task.client = self._client(
                 task.options, task.logger, qr_callback, cancel_check, stale=task.client
@@ -218,6 +224,7 @@ class RewardService:
     ) -> ClaimResult:
         duration = prepared_task.options.duration_seconds
         deadline = None if duration is None else time.monotonic() + duration
+        retry_budget = ClaimRetryBudget(prepared_task.options.max_retry, prepared_task.options.thread_count)
 
         def cancelled():
             if deadline is not None and time.monotonic() >= deadline:
@@ -244,10 +251,14 @@ class RewardService:
                     if deadline is None
                     else max(0.001, deadline - time.monotonic()),
                     jitter_ms=prepared_task.options.jitter_ms,
+                    retry_budget=retry_budget,
+                    cancel_check=cancelled,
                 )
                 prepared_task.logger.log(f"[任务] 领取成功，cdkey={cdkey}")
                 return ClaimResult(award_info, cdkey)
             except BiliCookieInvalidError as exc:
+                if not retry_budget.has_remaining():
+                    raise BiliRewardError(f"领取超过最大重试次数；最后错误: {exc}") from exc
                 if attempt:
                     raise BiliRewardError(
                         f"[Cookie] 重新登录后仍然失效: {exc}"

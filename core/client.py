@@ -5,7 +5,6 @@ import random
 import threading
 import time
 import urllib.parse
-from itertools import count
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Callable
 
@@ -33,6 +32,7 @@ from .models import (
     AwardInfo,
     ClaimExecutionControl,
     ClaimOptions,
+    ClaimRetryBudget,
     OptionalCancelCheck,
     OptionalLogCallback,
 )
@@ -86,8 +86,10 @@ class BiliRewardClient:
         *,
         limiter: RequestLimiter | None = None,
         wall_time: Callable[[], float] | None = None,
+        request_interval: float = 0,
     ) -> None:
         self.timeout = timeout
+        self.request_interval = request_interval
         self._wall_time = wall_time or time.time
         self.cookie_string = cookie_string
         pairs = (part.split("=", 1) for part in cookie_string.split(";") if "=" in part)
@@ -147,7 +149,7 @@ class BiliRewardClient:
         data: Optional[bytes] = None,
         headers: Optional[dict[str, str]] = None,
     ) -> dict:
-        with self.limiter.request_slot(self._check_request):
+        with self.limiter.request_slot(self._check_request, self.request_interval):
             return self._perform_request(url, data, headers)
 
     def _perform_request(self, url, data, headers) -> dict:
@@ -227,14 +229,23 @@ class BiliRewardClient:
                 self._wbi_lock.release()
             self._local.fetching_keys = False
 
-    def ensure_logged_in(self) -> dict:
-        payload = self._request_json(NAV_URL)
-        if not (payload.get("data") or {}).get("isLogin"):
-            raise BiliCookieInvalidError("[Cookie] 当前登录态无效: NAV isLogin=false")
-        self.get_csrf()
-        with self._wbi_lock:
-            self._cache_wbi_keys(payload)
-        return payload.get("data") or {}
+    def ensure_logged_in(self, *, cancel_check: OptionalCancelCheck = None) -> dict:
+        previous = getattr(self._local, "check", None)
+        if cancel_check is not None:
+            self._local.check = lambda: self._check_cancel(cancel_check)
+        try:
+            payload = self._request_json(NAV_URL)
+            data = payload.get("data") or {}
+            if not isinstance(data, dict):
+                raise BiliRewardError("[Cookie] 登录验证返回内容格式无效")
+            if not data.get("isLogin"):
+                raise BiliCookieInvalidError("[Cookie] 当前登录态无效: NAV isLogin=false")
+            self.get_csrf()
+            with self._wbi_lock:
+                self._cache_wbi_keys(payload)
+            return data
+        finally:
+            self._local.check = previous
 
     def get_web_sign(self, params: Optional[dict[str, str]] = None) -> str:
         raw_params = dict(params or {})
@@ -345,6 +356,8 @@ class BiliRewardClient:
         stop_sold_out: bool = True,
         duration_seconds: float | None = None,
         jitter_ms: int = 0,
+        retry_budget: ClaimRetryBudget | None = None,
+        cancel_check: OptionalCancelCheck = None,
     ) -> tuple[AwardInfo, str]:
         ClaimOptions(
             task_id,
@@ -357,9 +370,12 @@ class BiliRewardClient:
             jitter_ms,
         )
         control = claim_control or ClaimExecutionControl()
+        budget = retry_budget or ClaimRetryBudget(max_retry, thread_count)
+        self._check_cancel(cancel_check)
         control.check_cancelled()
         award_info = award_info or self.get_award_info(
-            task_id, log_callback=log_callback, cancel_check=control.is_cancelled
+            task_id, log_callback=log_callback,
+            cancel_check=lambda: control.is_cancelled() or (cancel_check is not None and cancel_check()),
         )
         body = urllib.parse.urlencode(
             {
@@ -378,13 +394,19 @@ class BiliRewardClient:
             None if duration_seconds is None else time.monotonic() + duration_seconds
         )
 
+        def check_wait() -> None:
+            self._check_cancel(cancel_check)
+            self.limiter.check_blocked()
+
         def check() -> None:
             if stop.is_set():
                 raise _ClaimStopped("任务已结束")
+            check_wait()
             if deadline is not None and time.monotonic() >= deadline:
                 raise BiliRewardTimeoutError("[任务] 已达到执行时长，停止该链接")
             if not getattr(self._local, "fetching_keys", False):
-                control.wait_if_paused(stop_event=stop, deadline=deadline)
+                control.wait_if_paused(stop_event=stop, deadline=deadline,
+                                       check_callback=check_wait)
             if stop.is_set():
                 raise _ClaimStopped("任务已结束")
             control.check_cancelled()
@@ -394,10 +416,11 @@ class BiliRewardClient:
             last_error = ""
             network_failures = 0
             try:
-                for attempt in count(1):
-                    if max_retry is not None and attempt > max_retry:
-                        break
+                while True:
                     check()
+                    attempt = budget.reserve(worker_id)
+                    if attempt is None:
+                        break
                     delay = retry_interval
                     try:
                         payload = self._signed_request(MISSION_RECEIVE_URL, data=body)
@@ -455,7 +478,7 @@ class BiliRewardClient:
                         last_error = str(exc)
                     if log_callback is not None:
                         log_callback(last_error)
-                    if max_retry is None or attempt < max_retry:
+                    if budget.has_remaining(worker_id):
                         if jitter_ms:
                             delay += random.uniform(0, jitter_ms / 1000)
                         until = time.monotonic() + delay
