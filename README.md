@@ -1,8 +1,6 @@
-# GetLiveAward
+# 哔哩哔哩激励助手
 
 Bilibili 直播奖励领取桌面工具。支持扫码登录、多个账号档案、多个独立领取任务、定时启动和领取结果记录。
-
-> **项目来源：** 基于 [yuzeeesama/GetLiveAward](https://github.com/yuzeeesama/GetLiveAward) 开发。此仓库在上游基础上增加并调整了任务管理、账号档案、执行控制、时间同步和界面等功能。
 
 ## 快速开始
 
@@ -63,6 +61,7 @@ B 站返回 `202032`（无资格领取奖励）时，程序按设置继续重试
 ## 来源与许可
 
 本项目基于 [yuzeeesama/GetLiveAward](https://github.com/yuzeeesama/GetLiveAward)，并保留本地 Git 提交历史以记录来源和后续改动。
+
 
 上游仓库当前没有声明开源许可证。本文中的来源说明用于致谢，不代表授予代码再发布或商用许可。重新分发上游代码或二进制前，请先确认适用的授权。
 
