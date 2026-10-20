@@ -12,10 +12,11 @@ from core.clock_sync import (
     query_ntp,
 )
 from core.errors import BiliRewardError
+from core.models import RunSettings
 
 
 class ClockTests(unittest.TestCase):
-    def exchange(self, mutate=lambda data: data, base=1700000000.0):
+    def exchange(self, mutate=lambda data: data, base=1700000000.0, wall_elapsed=0.1, elapsed=0.1):
         sock = Mock()
         sock.__enter__ = Mock(return_value=sock)
         sock.__exit__ = Mock(return_value=False)
@@ -37,8 +38,8 @@ class ClockTests(unittest.TestCase):
                 ],
             ),
             patch("core.clock_sync.socket.socket", return_value=sock),
-            patch("core.clock_sync.time.time", side_effect=[base, base + 0.1]),
-            patch("core.clock_sync.time.monotonic", side_effect=[10.0, 10.1]),
+            patch("core.clock_sync.time.time", side_effect=[base, base + wall_elapsed]),
+            patch("core.clock_sync.time.perf_counter", side_effect=[10.0, 10.0 + elapsed]),
         ):
             return query_ntp("test.example", 2)
 
@@ -50,6 +51,15 @@ class ClockTests(unittest.TestCase):
     def test_ntp_era_after_2036(self):
         sample = self.exchange(base=datetime(2036, 2, 8, tzinfo=BEIJING).timestamp())
         self.assertAlmostEqual(sample.offset, 0.2, places=5)
+
+    def test_ntp_anchor_uses_precise_round_trip_despite_coarse_wall_clock(self):
+        sample = self.exchange(wall_elapsed=0, elapsed=0.01)
+        self.assertAlmostEqual(sample.epoch, 1700000000.255, places=5)
+        self.assertAlmostEqual(sample.round_trip, 0.01)
+
+    def test_ntp_rejects_wall_clock_jump(self):
+        with self.assertRaisesRegex(BiliRewardError, "跳变"):
+            self.exchange(wall_elapsed=1)
 
     def test_rejects_bad_origin(self):
         def mutate(data):
@@ -80,16 +90,26 @@ class ClockTests(unittest.TestCase):
         ):
             clock.sync("test.example")
         with (
-            patch("core.clock_sync.time.monotonic", return_value=12),
+            patch("core.clock_sync.time.perf_counter", return_value=12),
             patch("core.clock_sync.time.time", return_value=9000),
         ):
             self.assertEqual(clock.now(), 102)
             self.assertEqual(clock.age(), 2)
 
-    def test_midnight_is_next_beijing_day_with_100ms_delay(self):
+    def test_synced_clock_advances_within_a_coarse_monotonic_tick(self):
+        clock = NetworkClock()
+        with patch("core.clock_sync.query_ntp", return_value=TimeSample(100, 10, 0, 0.01)):
+            clock.sync("test.example")
+        with (patch("core.clock_sync.time.monotonic", return_value=10),
+              patch("core.clock_sync.time.perf_counter", return_value=10.0005)):
+            self.assertAlmostEqual(clock.now(), 100.0005)
+            self.assertAlmostEqual(clock.age(), 0.0005)
+
+    def test_midnight_is_next_beijing_day_with_default_20ms_delay(self):
         now = datetime(2026, 10, 20, 10, tzinfo=BEIJING).timestamp()
-        target = next_scheduled_time(now, "00:00:00", 100)
-        expected = datetime(2026, 10, 21, tzinfo=BEIJING).timestamp() + 0.1
+        settings = RunSettings()
+        target = next_scheduled_time(now, settings.scheduled_time, settings.start_delay_ms)
+        expected = datetime(2026, 10, 21, tzinfo=BEIJING).timestamp() + 0.02
         self.assertAlmostEqual(target, expected, places=5)
 
     def test_start_inside_delay_window_uses_today(self):

@@ -104,6 +104,10 @@ class ClaimWorker(QObject):
                         self._emit_batch_log(f"[校时] 过期样本刷新失败: {exc}")
                 raise BiliRewardError("[校时] 样本过期，停止定时任务，请检查时间服务器")
             if remaining <= 0:
+                self._emit_batch_log(
+                    f"[定时] 等待结束，唤醒偏差 {-remaining * 1000:+.3f} ms"
+                    "（不含请求准备、限流等待与网络耗时）"
+                )
                 if remaining < -0.1:
                     self._emit_batch_log(
                         f"[定时] 目标已过 {-remaining:.3f}s，立即开始（准备、网络或系统调度可能造成延迟）"
@@ -150,7 +154,18 @@ class ClaimWorker(QObject):
             if seconds != last_remaining and (remaining <= 10 or seconds % 30 == 0):
                 self._emit_batch_log(f"[定时] 距首发约 {remaining:.1f}s")
                 last_remaining = seconds
-            self._cancel_event.wait(min(0.05, remaining))
+            if remaining > 60:
+                self._cancel_event.wait(min(0.25, remaining))
+            elif remaining > 10:
+                self._cancel_event.wait(min(0.05, remaining))
+            elif remaining > 1:
+                self._cancel_event.wait(min(0.01, remaining))
+            else:
+                # Event.wait uses a millisecond-based lock timeout on Windows.
+                # Python 3.11+ sleep uses a waitable timer there, so reserve it
+                # for the final second. Recheck cancellation on every tick and
+                # never spin or change the system-wide timer resolution.
+                time.sleep(min(0.001, remaining))
 
     def cancel_login(self) -> None:
         self._login_cancel_event.set()

@@ -68,7 +68,7 @@ class RunSettings:
     time_server: str = "ntp.aliyun.com"
     sync_interval_seconds: int = 60
     scheduled_time: str = "00:00:00"
-    start_delay_ms: int = 100
+    start_delay_ms: int = 20
     scheduled_retry_mode: str = "count"
 
     def __post_init__(self) -> None:

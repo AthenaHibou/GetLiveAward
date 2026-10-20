@@ -277,6 +277,51 @@ class TaskSchedulerTests(unittest.TestCase):
         self.service = RewardService(self.temp.name)
         self.addCleanup(self.service.close)
 
+    def test_scheduled_wait_tightens_near_target_and_never_returns_early(self):
+        worker = ClaimWorker(self.service, [LinkTaskItem(0, "", "a")])
+        now = [0.0]
+        target = 61.25
+        waits, sleeps, logs = [], [], []
+        self.service.clock = SimpleNamespace(now=lambda: now[0], age=lambda: 0)
+        worker.log_message.connect(logs.append)
+
+        def advance(delay, records):
+            records.append((target - now[0], delay))
+            now[0] += delay
+
+        with (patch("ui.worker.time.monotonic", side_effect=lambda: now[0]),
+              patch.object(worker, "_sync_clock"),
+              patch.object(worker._cancel_event, "wait", side_effect=lambda delay: advance(delay, waits)),
+              patch("ui.worker.time.sleep", side_effect=lambda delay: advance(delay, sleeps))):
+            worker._wait_scheduled(target, {})
+        self.assertGreaterEqual(now[0], target)
+        self.assertLess(now[0] - target, 0.000001)
+        for lower, upper, maximum in ((60, 62, 0.25), (10, 60, 0.05), (1, 10, 0.01)):
+            phase = [(remaining, delay) for remaining, delay in waits if lower < remaining <= upper]
+            self.assertTrue(phase)
+            self.assertTrue(all(0 < delay <= min(maximum, remaining) for remaining, delay in phase))
+        self.assertTrue(sleeps)
+        self.assertTrue(all(0 < delay <= min(0.001, remaining) and remaining <= 1
+                            for remaining, delay in sleeps))
+        self.assertTrue(any("唤醒偏差" in line for line in logs))
+
+    def test_final_scheduled_wait_stays_cancellable_and_does_not_sync(self):
+        for cancel_one in (False, True):
+            worker = ClaimWorker(self.service, [LinkTaskItem(0, "", "a")])
+            self.service.clock = SimpleNamespace(now=lambda: 100.0, age=lambda: 0)
+            cancel = (lambda delay: worker.cancel_claim(0)) if cancel_one else (lambda delay: worker.cancel_all())
+            with (patch.object(worker, "_sync_clock") as sync,
+                  patch.object(self.service, "refresh_prepared_task") as refresh,
+                  patch("ui.worker.time.sleep", side_effect=cancel) as sleep,
+                  patch.object(worker._cancel_event, "wait") as coarse):
+                with self.assertRaises(BiliRewardCancelledError):
+                    worker._wait_scheduled(100.0005, {0: Mock()})
+            self.assertAlmostEqual(sleep.call_args.args[0], 0.0005)
+            sleep.assert_called_once()
+            coarse.assert_not_called()
+            sync.assert_not_called()
+            refresh.assert_not_called()
+
     def test_task_options_and_global_serial_limit_reach_service(self):
         tasks = [LinkTaskItem(0, "", "a", RunSettings(max_retry=3, interval_ms=700)),
                  LinkTaskItem(1, "", "b", RunSettings(max_retry=7, interval_ms=1500, concurrent=True))]

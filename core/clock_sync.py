@@ -16,7 +16,7 @@ BEIJING = timezone(timedelta(hours=8))
 @dataclass(frozen=True)
 class TimeSample:
     epoch: float
-    monotonic: float
+    monotonic: float  # High-resolution, monotonic perf_counter anchor.
     offset: float
     round_trip: float
 
@@ -34,13 +34,13 @@ def query_ntp(server: str, timeout: float = 2.0) -> TimeSample:
         with socket.socket(family, kind, protocol) as sock:
             sock.settimeout(timeout)
             sock.connect(address)
-            t1, m1 = time.time(), time.monotonic()
+            t1, m1 = time.time(), time.perf_counter()
             packet = bytearray(48)
             packet[0] = 0x23  # Version 4, client mode.
             packet[40:48] = _timestamp(t1)
             sock.send(packet)
             response = sock.recv(512)
-            t4, m4 = time.time(), time.monotonic()
+            t4, m4 = time.time(), time.perf_counter()
     except (OSError, IndexError) as exc:
         raise BiliRewardError(
             f"[校时] 无法连接 {server}: {type(exc).__name__}"
@@ -67,8 +67,12 @@ def query_ntp(server: str, timeout: float = 2.0) -> TimeSample:
     round_trip = (m4 - m1) - (t3 - t2)
     if t3 < t2 or round_trip < -0.002 or round_trip > timeout:
         raise BiliRewardError("[校时] NTP 往返时间无效")
-    offset = ((t2 - t1) + (t3 - t4)) / 2
-    return TimeSample(t4 + offset, m4, offset, max(0.0, round_trip))
+    round_trip = max(0.0, round_trip)
+    # As with the NTP offset formula, assume symmetric network delay. Anchor
+    # server time directly to the high-resolution receive counter so coarse
+    # Windows time.time() ticks do not quantize the corrected epoch.
+    epoch = t3 + round_trip / 2
+    return TimeSample(epoch, m4, epoch - t4, round_trip)
 
 
 class NetworkClock:
@@ -84,13 +88,13 @@ class NetworkClock:
         return (
             time.time()
             if sample is None
-            else sample.epoch + time.monotonic() - sample.monotonic
+            else sample.epoch + (time.perf_counter() - sample.monotonic)
         )
 
     def age(self) -> float:
         with self._lock:
             sample = self._sample
-        return float("inf") if sample is None else time.monotonic() - sample.monotonic
+        return float("inf") if sample is None else time.perf_counter() - sample.monotonic
 
     def sync(self, server: str, timeout: float = 2.0) -> TimeSample:
         sample = query_ntp(server, timeout)

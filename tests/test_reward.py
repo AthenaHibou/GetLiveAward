@@ -922,7 +922,7 @@ class UiTests(unittest.TestCase):
             [LinkTaskItem(0, "", "task")],
             RunSettings(retry_mode="scheduled"),
         )
-        sample = TimeSample(time.time(), time.monotonic(), 0, 0.01)
+        sample = TimeSample(time.time(), time.perf_counter(), 0, 0.01)
         with (
             patch.object(self.service, "configure", side_effect=configure),
             patch("core.clock_sync.query_ntp", return_value=sample),

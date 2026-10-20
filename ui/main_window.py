@@ -371,7 +371,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         self.guide = OnboardingOverlay(self.centralWidget(), [
             (self.link_rows[0].input, "添加领取任务", "粘贴具体奖励的领取 / 兑换页链接，地址需带 task_id。可给任务起名；勾选的任务参与「全部开始」。"),
             (self.account_combo, account_step_title, account_step_body),
-            (self.settings_panel.mode, "每条任务，独立设置", "点任务的「设置」，右侧选次数、时长或定时，再点「运行」单跑。定时默认北京时间 00:00 + 100 ms，需提前登录并保持电脑唤醒。\n\n配置自动保存，可存模板复用；并发与最小间隔在全局设置中调整。"),
+            (self.settings_panel.mode, "每条任务，独立设置", "点任务的「设置」，右侧选次数、时长或定时，再点「运行」单跑。定时默认北京时间 00:00 + 20 ms，需提前登录并保持电脑唤醒。\n\n配置自动保存，可存模板复用；并发与最小间隔在全局设置中调整。"),
             (self.log_text, "结果看这里，随时停止", "领取结果和兑换码会显示在这里。部分奖励直接发放至账号，不提供兑换码。无资格会继续尝试，IP 异常会停止。可逐条取消或点「全部停止」。"),
         ])
         self.guide.dismissed.connect(self._save_tutorial_preference)
