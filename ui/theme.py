@@ -5,6 +5,7 @@ resolutions. Baseline is 96 DPI.
 """
 from __future__ import annotations
 
+from PyQt5.QtGui import QFont, QFontDatabase
 from PyQt5.QtWidgets import QApplication
 
 # ── Palette ────────────────────────────────────────────
@@ -30,7 +31,7 @@ def _scale(s: float, fs: int) -> str:
     return f"{round(fs * s)}px"
 
 
-def _build_qss(scale: float) -> str:
+def _build_qss(scale: float, font_family: str = "Microsoft YaHei UI") -> str:
     s = scale  # shorthand
     return f"""
 /* ── Global ─────────────────────────────────── */
@@ -39,7 +40,7 @@ QMainWindow {{
 }}
 
 QWidget {{
-    font-family: "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", sans-serif;
+    font-family: "{font_family}";
     font-size: {_scale(s, 14)};
     color: {TEXT_MAIN};
 }}
@@ -53,7 +54,7 @@ QLabel#flowHint {{
 }}
 QLabel[cssClass="sectionTitle"] {{
     font-size: {_scale(s, 15)};
-    font-weight: 700;
+    font-weight: 600;
 }}
 QPushButton[cssClass="loginBtn"] {{
     color: {BLUE};
@@ -69,7 +70,7 @@ QPushButton {{
     border-radius: {_scale(s, 10)};
     padding: {_scale(s, 7)} {_scale(s, 18)};
     font-size: {_scale(s, 13)};
-    font-weight: 500;
+    font-weight: 400;
 }}
 QPushButton:hover {{
     border-color: {BLUE};
@@ -304,8 +305,7 @@ QLabel[cssClass="status"] {{
 
 QLabel[cssClass="title"] {{
     font-size: {_scale(s, 25)};
-    font-weight: 800;
-    letter-spacing: 1px;
+    font-weight: 600;
     color: {TEXT_MAIN};
 }}
 
@@ -322,7 +322,7 @@ QPlainTextEdit {{
     border: 1.5px solid {BORDER};
     border-radius: {_scale(s, 14)};
     padding: {_scale(s, 14)};
-    font-family: "Cascadia Code", "Fira Code", "Consolas", "Microsoft YaHei UI", monospace;
+    font-family: "{font_family}";
     font-size: {_scale(s, 13)};
     selection-background-color: {BLUE};
     selection-color: #FFFFFF;
@@ -423,5 +423,17 @@ def apply_theme(app: QApplication) -> None:
     if screen is not None:
         dpi = screen.logicalDotsPerInch()
         SCALE = dpi / 96.0
-    qss = _build_qss(SCALE)
+    # Resolve one installed CJK family for both Qt and QSS. Code fonts in the
+    # log otherwise give Chinese and Latin text noticeably different metrics.
+    families = set(QFontDatabase().families())
+    family = next((name for name in ("Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+                                     "Noto Sans SC", "WenQuanYi Micro Hei")
+                   if name in families), app.font().family())
+    font = QFont(family)
+    font.setPixelSize(round(14 * SCALE))
+    font.setWeight(QFont.Normal)
+    font.setStyleStrategy(QFont.PreferAntialias | QFont.ForceOutline)
+    font.setHintingPreference(QFont.PreferNoHinting)
+    app.setFont(font)
+    qss = _build_qss(SCALE, family)
     app.setStyleSheet(qss)

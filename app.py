@@ -3,6 +3,12 @@ from __future__ import annotations
 import os
 import sys
 
+# Qt 5's native Windows font path produces jagged small CJK glyphs on some
+# systems. Use its bundled outline rasterizer; respect explicit platform
+# selections (including offscreen in tests).
+if sys.platform == "win32":
+    os.environ.setdefault("QT_QPA_PLATFORM", "windows:fontengine=freetype")
+
 if sys.version_info < (3, 10):
     raise SystemExit("GetLiveAward 需要 Python 3.10 或以上版本，建议使用 Python 3.12。")
 
@@ -17,6 +23,8 @@ from ui.theme import apply_theme
 # Enable high-DPI scaling — must happen before QApplication creation
 os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
 
 def main() -> int:
