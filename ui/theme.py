@@ -44,6 +44,23 @@ QWidget {{
     color: {TEXT_MAIN};
 }}
 
+QLabel#flowHint {{
+    background: #EAF7FC;
+    color: #18718E;
+    padding: {_scale(s, 9)} {_scale(s, 12)};
+    border: 1px solid #CDEAF4;
+    border-radius: {_scale(s, 10)};
+}}
+QLabel[cssClass="sectionTitle"] {{
+    font-size: {_scale(s, 15)};
+    font-weight: 700;
+}}
+QPushButton[cssClass="loginBtn"] {{
+    color: {BLUE};
+    border-color: {BLUE};
+    font-weight: 600;
+}}
+
 /* ── QPushButton base ────────────────────────── */
 QPushButton {{
     background-color: {CARD_BG};
@@ -152,6 +169,14 @@ QPushButton[cssClass="cancelBtn"]:hover {{
     border-color: #FF6B7A;
 }}
 
+QPushButton[cssClass="pauseBtn"]:disabled,
+QPushButton[cssClass="resumeBtn"]:disabled,
+QPushButton[cssClass="cancelBtn"]:disabled {{
+    color: {TEXT_DIM};
+    background-color: #F5F4F2;
+    border-color: #E3E0DC;
+}}
+
 /* ── QLineEdit ───────────────────────────────── */
 QLineEdit {{
     background-color: {INPUT_BG};
@@ -174,6 +199,53 @@ QLineEdit:disabled {{
     background-color: #F5F4F2;
     color: {TEXT_DIM};
 }}
+
+QSpinBox, QDoubleSpinBox, QComboBox, QTimeEdit {{
+    background: #FFFFFF;
+    color: {TEXT_MAIN};
+    border: 1px solid {BORDER};
+    border-radius: {_scale(s, 6)};
+    padding: {_scale(s, 4)};
+    min-height: {_scale(s, 22)};
+}}
+QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled, QTimeEdit:disabled {{
+    background: #F5F4F2;
+    color: {TEXT_DIM};
+}}
+QComboBox {{
+    background: {INPUT_BG};
+    border: 1px solid {BORDER};
+    border-radius: {_scale(s, 10)};
+    padding: {_scale(s, 6)} {_scale(s, 26)} {_scale(s, 6)} {_scale(s, 10)};
+    selection-background-color: #EAF7FC;
+    selection-color: #18718E;
+    combobox-popup: 0;
+}}
+QComboBox:hover, QComboBox:focus, QComboBox:on {{
+    border-color: {BLUE};
+    background: #F0F9FD;
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: {_scale(s, 25)};
+    background: transparent;
+}}
+QComboBox::down-arrow {{ image: none; }}
+QComboBox QAbstractItemView {{
+    background: #FFFFFF;
+    border: 1px solid #CDEAF4;
+    border-radius: {_scale(s, 10)};
+    padding: {_scale(s, 4)};
+    outline: none;
+    selection-background-color: #EAF7FC;
+    selection-color: #18718E;
+}}
+QComboBox QAbstractItemView::item {{
+    min-height: {_scale(s, 30)};
+    padding: {_scale(s, 3)} {_scale(s, 8)};
+    border-radius: {_scale(s, 6)};
+}}
+QComboBox QAbstractItemView::item:hover {{ background: #F0F9FD; }}
 
 /* ── QLabel ─────────────────────────────────── */
 QLabel {{
@@ -208,8 +280,8 @@ QLabel[cssClass="indexLabel"] {{
     color: {TEXT_MAIN};
 }}
 
-/* ── QTextEdit ──────────────────────────────── */
-QTextEdit {{
+/* ── Log editor ─────────────────────────────── */
+QPlainTextEdit {{
     background-color: #FFFFFF;
     color: {TEXT_MAIN};
     border: 1.5px solid {BORDER};
@@ -220,7 +292,7 @@ QTextEdit {{
     selection-background-color: {BLUE};
     selection-color: #FFFFFF;
 }}
-QTextEdit:focus {{
+QPlainTextEdit:focus {{
     border-color: {BLUE};
 }}
 

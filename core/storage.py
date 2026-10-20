@@ -4,13 +4,18 @@ import json
 import os
 import sys
 import time
+import tempfile
 from typing import Optional
 
 from .errors import BiliRewardError
 from .models import RuntimePaths
+from .accounts import DEFAULT_ACCOUNT, validate_account_id
 
 
-def get_runtime_paths(base_dir: Optional[str] = None) -> RuntimePaths:
+def get_runtime_paths(
+    base_dir: Optional[str] = None, account_id: str = DEFAULT_ACCOUNT
+) -> RuntimePaths:
+    validate_account_id(account_id)
     if base_dir is not None:
         root_dir = base_dir
     elif getattr(sys, "frozen", False):
@@ -18,6 +23,8 @@ def get_runtime_paths(base_dir: Optional[str] = None) -> RuntimePaths:
     else:
         root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_dir = os.path.join(root_dir, "data")
+    if account_id != DEFAULT_ACCOUNT:
+        data_dir = os.path.join(data_dir, "accounts", account_id)
     logs_dir = os.path.join(data_dir, "logs")
     return RuntimePaths(
         data_dir=data_dir,
@@ -45,8 +52,20 @@ def save_cookie_file(cookie_file: str, cookies: dict[str, str]) -> None:
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "cookies": cookies,
     }
-    with open(cookie_file, "w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=os.path.dirname(os.path.abspath(cookie_file)),
+            delete=False,
+        ) as file:
+            temporary = file.name
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        os.replace(temporary, cookie_file)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.remove(temporary)
 
 
 def load_cookie_file(cookie_file: str) -> Optional[dict[str, str]]:
@@ -56,9 +75,11 @@ def load_cookie_file(cookie_file: str) -> Optional[dict[str, str]]:
     try:
         with open(cookie_file, "r", encoding="utf-8") as file:
             payload = json.load(file)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, UnicodeError):
         return None
 
+    if not isinstance(payload, dict):
+        return None
     cookies = payload.get("cookies")
     if not isinstance(cookies, dict):
         return None

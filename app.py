@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import sys
 
+if sys.version_info < (3, 10):
+    raise SystemExit("GetLiveAward 需要 Python 3.10 或以上版本，建议使用 Python 3.12。")
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
 

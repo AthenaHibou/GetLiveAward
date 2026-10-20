@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import threading
+import math
+import time
 from typing import Any
 from dataclasses import dataclass
 from typing import Callable, Optional
+from datetime import time as DayTime
 
-from .errors import BiliRewardCancelledError
+from .errors import BiliRewardCancelledError, BiliRewardTimeoutError
 
 
 @dataclass(slots=True)
@@ -19,10 +22,129 @@ class AwardInfo:
 @dataclass(slots=True)
 class ClaimOptions:
     task_id: str
-    thread_count: int = 2
-    max_retry: int = 120
+    thread_count: int = 1
+    max_retry: int | None = 120
     retry_interval: float = 1.0
     timeout: float = 10.0
+    stop_sold_out: bool = True
+    duration_seconds: float | None = None
+    jitter_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.thread_count <= 4:
+            raise ValueError("线程数必须在 1 到 4 之间")
+        if (
+            (self.max_retry is not None and self.max_retry < 1)
+            or not math.isfinite(self.retry_interval)
+            or self.retry_interval < 0
+            or not math.isfinite(self.timeout)
+            or self.timeout <= 0
+        ):
+            raise ValueError("重试次数和超时必须为正数，重试间隔不能为负数")
+        if self.duration_seconds is not None and (
+            not math.isfinite(self.duration_seconds) or self.duration_seconds <= 0
+        ):
+            raise ValueError("执行时长必须是正数")
+        if not 0 <= self.jitter_ms <= 60000:
+            raise ValueError("抖动范围必须在 0 到 60000 ms 之间")
+
+
+@dataclass(frozen=True, slots=True)
+class RunSettings:
+    concurrent: bool = False
+    request_workers: int = 2
+    parallel_links: bool = False
+    link_workers: int = 2
+    interval_ms: int = 1000
+    retry_mode: str = "count"
+    max_retry: int = 120
+    duration_minutes: float = 5.0
+    timeout: float = 10.0
+    stop_sold_out: bool = True
+    jitter_enabled: bool = False
+    jitter_ms: int = 200
+    time_sync_enabled: bool = False
+    time_server: str = "ntp.aliyun.com"
+    sync_interval_seconds: int = 60
+    scheduled_time: str = "00:00:00"
+    start_delay_ms: int = 100
+    scheduled_retry_mode: str = "count"
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.request_workers <= 4 or not 1 <= self.link_workers <= 4:
+            raise ValueError("并发数必须在 1 到 4 之间")
+        if not 100 <= self.interval_ms <= 60000:
+            raise ValueError("请求间隔必须在 100 到 60000 ms 之间")
+        if self.retry_mode not in ("count", "duration", "continuous", "scheduled"):
+            raise ValueError("执行方式无效")
+        if self.scheduled_retry_mode not in ("count", "duration", "continuous"):
+            raise ValueError("定时后的执行方式无效")
+        if not 0 <= self.jitter_ms <= 60000 or not 0 <= self.start_delay_ms <= 60000:
+            raise ValueError("抖动和首发延迟必须在 0 到 60000 ms 之间")
+        if not 5 <= self.sync_interval_seconds <= 3600:
+            raise ValueError("校时间隔必须在 5 到 3600 秒之间")
+        if (
+            not self.time_server
+            or len(self.time_server) > 253
+            or any(
+                ch
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"
+                for ch in self.time_server
+            )
+        ):
+            raise ValueError("时间服务器应为主机名或 IPv4 地址，不含协议和端口")
+        if len(self.scheduled_time) != 8:
+            raise ValueError("定时时间格式必须为 HH:mm:ss")
+        DayTime.fromisoformat(self.scheduled_time)
+        if (
+            not math.isfinite(self.duration_minutes)
+            or not 0.1 <= self.duration_minutes <= 1440
+        ):
+            raise ValueError("执行时长必须在 0.1 到 1440 分钟之间")
+        if (
+            not math.isfinite(self.timeout)
+            or not 1 <= self.timeout <= 60
+            or not 1 <= self.max_retry <= 100000
+        ):
+            raise ValueError("超时或重试次数超出范围")
+
+    @property
+    def active_requests(self) -> int:
+        return self.request_workers if self.concurrent else 1
+
+    @property
+    def active_links(self) -> int:
+        return self.link_workers if self.concurrent and self.parallel_links else 1
+
+    @property
+    def interval(self) -> float:
+        return self.interval_ms / 1000
+
+    @property
+    def effective_retry_mode(self) -> str:
+        return (
+            self.scheduled_retry_mode
+            if self.retry_mode == "scheduled"
+            else self.retry_mode
+        )
+
+    @property
+    def sync_required(self) -> bool:
+        return self.time_sync_enabled or self.retry_mode == "scheduled"
+
+    def claim_options(self, task_id: str) -> ClaimOptions:
+        return ClaimOptions(
+            task_id,
+            self.active_requests,
+            self.max_retry if self.effective_retry_mode == "count" else None,
+            self.interval,
+            self.timeout,
+            self.stop_sold_out,
+            self.duration_minutes * 60
+            if self.effective_retry_mode == "duration"
+            else None,
+            self.jitter_ms if self.jitter_enabled else 0,
+        )
 
 
 @dataclass(slots=True)
@@ -108,9 +230,19 @@ class ClaimExecutionControl:
     def is_paused(self) -> bool:
         return not self._resume_event.is_set() and not self._cancel_event.is_set()
 
-    def wait_if_paused(self, poll_interval: float = 0.1) -> None:
+    def wait_if_paused(
+        self,
+        poll_interval: float = 0.05,
+        *,
+        stop_event: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> None:
         while self.is_paused():
+            if stop_event is not None and stop_event.is_set():
+                return
             self.check_cancelled()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise BiliRewardTimeoutError("[任务] 已达到执行时长，停止该链接")
             self._resume_event.wait(timeout=poll_interval)
         self.check_cancelled()
 
