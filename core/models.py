@@ -153,7 +153,7 @@ class RunSettings:
 @dataclass(slots=True)
 class ClaimResult:
     award_info: AwardInfo
-    cdkey: str
+    cdkey: str | None
 
 
 @dataclass(slots=True)

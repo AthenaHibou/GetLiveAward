@@ -259,6 +259,19 @@ class ClientTests(unittest.TestCase):
             "TEST-KEY",
         )
 
+    def test_observed_stock_used_up_message_respects_stop_setting(self):
+        response = {"code": 75255, "message": "库存已经使用完"}
+        self.client._signed_request = Mock(return_value=response)
+        with self.assertRaisesRegex(BiliRewardError, "停止该链接"):
+            self.client.claim_award("task", award_info=AWARD, max_retry=5, retry_interval=0)
+        self.assertEqual(self.client._signed_request.call_count, 1)
+        self.client._signed_request = Mock(side_effect=[response, SUCCESS])
+        _, key = self.client.claim_award(
+            "task", award_info=AWARD, max_retry=2, retry_interval=0, stop_sold_out=False,
+        )
+        self.assertEqual(key, "TEST-KEY")
+        self.assertEqual(self.client._signed_request.call_count, 2)
+
     def test_ip_anomaly_text_blocks_batch_requests(self):
         response = Mock(status_code=200)
         response.json.return_value = {"code": 999, "message": "IP访问异常"}
@@ -273,12 +286,46 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(session.request.call_count, 1)
 
     def test_success_without_key_does_not_repeat_claim(self):
-        self.client._signed_request = Mock(return_value={"code": 0, "data": {}})
-        with self.assertRaisesRegex(BiliRewardError, "人工核对"):
-            self.client.claim_award(
-                "task", award_info=AWARD, thread_count=1, max_retry=10
-            )
-        self.assertEqual(self.client._signed_request.call_count, 1)
+        for data in (None, {}, [], {"extra_info": None}, {"extra_info": []},
+                     {"extra_info": {}}, {"extra_info": {"cdkey_content": ""}},
+                     {"extra_info": {"cdkey_content": "   "}},
+                     {"extra_info": {"cdkey_content": {"secret": "DO-NOT-LOG"}}}):
+            with self.subTest(data=data):
+                self.client._signed_request = Mock(return_value={"code": 0, "data": data})
+                logs = []
+                award, key = self.client.claim_award(
+                    "task", award_info=AWARD, thread_count=1, max_retry=10,
+                    log_callback=logs.append,
+                )
+                self.assertEqual(award, AWARD)
+                self.assertIsNone(key)
+                self.assertEqual(self.client._signed_request.call_count, 1)
+                self.assertIn("code=0（成功）", logs[0])
+                self.assertIn("cdkey_content=", logs[0])
+                self.assertNotIn("DO-NOT-LOG", "".join(logs))
+
+    def test_direct_reward_success_wins_over_inflight_login_error(self):
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        calls = []
+
+        def response(*args, **kwargs):
+            with lock:
+                index = len(calls)
+                calls.append(index)
+            barrier.wait(2)
+            if index == 0:
+                return {"code": -101, "message": "expired"}
+            time.sleep(0.05)
+            return {"code": 0}
+
+        self.client._signed_request = response
+        award, key = self.client.claim_award(
+            "task", award_info=AWARD, thread_count=2, max_retry=10,
+        )
+        self.assertEqual(award, AWARD)
+        self.assertIsNone(key)
+        self.assertEqual(len(calls), 2)
 
     def test_retry_budget_is_respected_per_worker(self):
         self.client._signed_request = Mock(return_value={"code": -702})

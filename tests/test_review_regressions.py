@@ -239,6 +239,8 @@ class ReviewTests(unittest.TestCase):
             receives.append(data)
             if len(receives) == 1:
                 return INELIGIBLE
+            if len(receives) == 3:
+                return {"code": 0, "data": {}}
             return {"code": 0, "data": {"extra_info": {"cdkey_content": "TEST-KEY"}}}
         with (patch.object(BiliRewardClient, "_perform_request", respond),
               patch("ui.main_window.QMessageBox.information")):
@@ -261,3 +263,11 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse(window._is_running)
         self.assertTrue(window.start_btn.isEnabled())
         self.assertIn("测试用户", window.account_combo.currentText())
+        self.assertIn("成功 2 / 失败 0", window.log_text.toPlainText())
+        with open(self.service.paths.log_file, encoding="utf-8") as stream:
+            logs = stream.read()
+        self.assertIn("code=0（成功）", logs)
+        self.assertIn("本次未返回兑换码", logs)
+        self.assertIn("奖励可能直接发放至账号", logs)
+        self.assertIn("兑换码=TEST-KEY", logs)
+        self.assertNotIn("执行失败", logs)

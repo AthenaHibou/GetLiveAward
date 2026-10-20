@@ -358,7 +358,7 @@ class BiliRewardClient:
         jitter_ms: int = 0,
         retry_budget: ClaimRetryBudget | None = None,
         cancel_check: OptionalCancelCheck = None,
-    ) -> tuple[AwardInfo, str]:
+    ) -> tuple[AwardInfo, str | None]:
         ClaimOptions(
             task_id,
             thread_count,
@@ -411,7 +411,7 @@ class BiliRewardClient:
                 raise _ClaimStopped("任务已结束")
             control.check_cancelled()
 
-        def worker(worker_id: int) -> str:
+        def worker(worker_id: int) -> str | None:
             self._local.check = check
             last_error = ""
             network_failures = 0
@@ -430,14 +430,26 @@ class BiliRewardClient:
                         )
                         if code == 0:
                             stop.set()
-                            cdkey = (
-                                (payload.get("data") or {}).get("extra_info") or {}
-                            ).get("cdkey_content")
-                            if not cdkey:
-                                raise BiliRewardError(
-                                    "领取成功，但返回中缺少 cdkey_content；请人工核对，已停止重复领取"
+                            data = payload.get("data")
+                            extra = data.get("extra_info") if isinstance(data, dict) else None
+                            cdkey = extra.get("cdkey_content") if isinstance(extra, dict) else None
+                            # Some rewards are credited directly and never return a code.
+                            # Successful API responses must stop retries in either case.
+                            if isinstance(cdkey, str) and cdkey.strip():
+                                return cdkey
+                            if log_callback is not None:
+                                field_state = (
+                                    "未提供" if not isinstance(extra, dict) or "cdkey_content" not in extra
+                                    else "空值" if cdkey is None or isinstance(cdkey, str) and not cdkey.strip()
+                                    else "类型异常"
                                 )
-                            return str(cdkey)
+                                log_callback(
+                                    "[领取-响应] code=0（成功）；"
+                                    f"data类型={type(data).__name__}, "
+                                    f"extra_info类型={type(extra).__name__}, "
+                                    f"cdkey_content={field_state}；已停止重复领取"
+                                )
+                            return None
                         last_error = format_api_failure(
                             "领取-提交",
                             code,
@@ -460,6 +472,7 @@ class BiliRewardClient:
                                     "库存不足",
                                     "库存已耗尽",
                                     "库存已用完",
+                                    "库存已经使用完",
                                     "每日库存已达上限",
                                     "奖励已领完",
                                     "奖品已领完",
@@ -504,7 +517,7 @@ class BiliRewardClient:
             except Exception as exc:
                 raise BiliRewardError(f"领取异常: {type(exc).__name__}") from exc
 
-        successes: list[str] = []
+        successes: list[str | None] = []
         failures: list[BiliRewardError] = []
         with ThreadPoolExecutor(max_workers=thread_count) as executor:
             futures = [executor.submit(worker, i + 1) for i in range(thread_count)]
@@ -525,7 +538,7 @@ class BiliRewardClient:
                 stop.set()
         # Drain in-flight responses: an earlier error must not discard a granted reward.
         if successes:
-            return award_info, successes[0]
+            return award_info, next((key for key in successes if key), None)
         for kind in (
             BiliRewardCancelledError,
             BiliRateLimitError,

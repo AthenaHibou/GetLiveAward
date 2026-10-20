@@ -254,7 +254,13 @@ class RewardService:
                     retry_budget=retry_budget,
                     cancel_check=cancelled,
                 )
-                prepared_task.logger.log(f"[任务] 领取成功，cdkey={cdkey}")
+                if cdkey:
+                    prepared_task.logger.log(f"[任务] 领取成功，兑换码={cdkey}")
+                else:
+                    prepared_task.logger.log(
+                        "[任务] 领取成功（接口 code=0）；本次未返回兑换码，"
+                        "奖励可能直接发放至账号，请到活动页或游戏内核对到账"
+                    )
                 return ClaimResult(award_info, cdkey)
             except BiliCookieInvalidError as exc:
                 if not retry_budget.has_remaining():
