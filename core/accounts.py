@@ -25,7 +25,7 @@ class AccountProfile:
 
 
 class AccountStore:
-    """Only account labels live in this index; cookies stay in isolated profiles."""
+    """Public account metadata lives here; cookies stay in isolated profiles."""
 
     def __init__(self, data_dir: str) -> None:
         self.path = os.path.join(data_dir, "accounts.json")

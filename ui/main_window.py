@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import re
 from urllib.parse import parse_qs, urlparse
 
-from PyQt5.QtCore import Qt, QThread, QSettings, QTimer
+from PyQt5.QtCore import Qt, QThread, QSettings, QTimer, QEvent
+from core.storage import get_runtime_paths
 from PyQt5.QtWidgets import (
     QFrame,
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -21,7 +24,8 @@ from PyQt5.QtWidgets import (
 )
 
 from core.logging_utils import format_log_line
-from core.models import BatchClaimResult, LinkTaskItem, QrCodeData
+from core.models import BatchClaimResult, LinkTaskItem, QrCodeData, RunSettings
+from core.task_config import SavedTask, with_globals
 from core.service import RewardService
 from core.accounts import AccountStore, AccountProfile, DEFAULT_ACCOUNT
 from core.errors import BiliRewardError
@@ -31,6 +35,7 @@ from ui.settings_panel import SettingsPanel
 from ui import theme
 from ui.worker import ClaimWorker, LoginWorker
 from ui.controls import SoftComboBox
+from ui.task_workspace import TaskWorkspaceMixin
 
 
 # ── Helpers ────────────────────────────────────────────
@@ -66,10 +71,16 @@ class LinkRowWidgets:
     resume_btn: QPushButton
     cancel_btn: QPushButton
     status_label: QLabel
+    config: SavedTask
+    name_edit: QLineEdit
+    enabled: QCheckBox
+    summary: QLabel
+    run_btn: QPushButton
+    settings_btn: QPushButton
 
 
 # ── Main Window ────────────────────────────────────────
-class MainWindow(QMainWindow):
+class MainWindow(TaskWorkspaceMixin, QMainWindow):
     STATUS_IDLE = "空闲"
     STATUS_RUNNING = "运行中"
     STATUS_SUCCESS = "成功"
@@ -83,11 +94,15 @@ class MainWindow(QMainWindow):
         self.worker: ClaimWorker | None = None
         self.qr_dialog: QrCodeDialog | None = None
         self._is_running = False
+        self._login_verified = False
+        self._login_checking = False
         self._closing = False
         self._current_qr_link_index: int | None = None
         self._row_claim_stage_active: dict[int, bool] = {}
         self.link_rows: list[LinkRowWidgets] = []
         self.guide: OnboardingOverlay | None = None
+        self._init_workspace()
+        self._global_settings = RunSettings()
         self._settings = QSettings(os.path.join(service.root_paths.data_dir, "ui.ini"), QSettings.IniFormat)
         self.account_store = AccountStore(service.root_paths.data_dir)
         self._account_error = ""
@@ -112,6 +127,7 @@ class MainWindow(QMainWindow):
         if selected != self.service.account_id:
             self._activate_account(selected)
         self._select_account_item(self.service.account_id)
+        self._load_workspace()
         if self._account_error:
             self.append_ui_log(f"[账号] {self._account_error}")
 
@@ -126,12 +142,12 @@ class MainWindow(QMainWindow):
 
         self.help_btn = _btn("使用教程", "helpBtn", root)
         self.help_btn.clicked.connect(self.show_tutorial)
-        self.login_btn = _btn("先登录", "loginBtn", root)
-        self.login_btn.setToolTip("检查本地登录；需要时弹出二维码，不会提交领取")
+        self.login_btn = _btn("登录当前账号", "loginBtn", root)
+        self.login_btn.setToolTip("验证当前账号的登录状态；未登录或已失效时会弹出二维码，不会提交领取")
         self.login_btn.clicked.connect(self.start_login)
-        self.start_btn = _btn("全部开始", "primary", root)
-        self.start_btn.setToolTip("按活动开放时间手动开始；每条链接独立执行")
-        self.start_btn.clicked.connect(self.start_claim)
+        self.start_btn = _btn("全部开始", "batchStart", root)
+        self.start_btn.setToolTip("运行所有已勾选任务；默认按顺序串行")
+        self.start_btn.clicked.connect(lambda: self.start_claim())
         self.stop_all_btn = _btn("全部停止", "cancelBtn", root)
         self.stop_all_btn.setEnabled(False)
         self.stop_all_btn.clicked.connect(self.stop_all)
@@ -159,7 +175,8 @@ class MainWindow(QMainWindow):
         self.login_status = QLabel("本地登录待验证" if os.path.exists(self.service.paths.cookie_file) else "尚未登录")
         _css(self.login_status, "dim")
         subtitle = QHBoxLayout()
-        subtitle.addWidget(QLabel("BILIBILI  /  先完成扫码，再等待奖励开放"))
+        self.product_hint = QLabel("BILIBILI  /  登录当前账号后，等待奖励开放再开始领取")
+        subtitle.addWidget(self.product_hint)
         subtitle.addStretch()
         self.account_combo = SoftComboBox(root)
         self.account_combo.setMinimumWidth(round(130 * theme.SCALE))
@@ -167,7 +184,7 @@ class MainWindow(QMainWindow):
         self.account_combo.setToolTip("当前使用的账号；运行期间不能切换")
         self.account_combo.setAccessibleName("当前账号")
         for profile in self._account_profiles:
-            self.account_combo.addItem(profile.name, profile.account_id)
+            self.account_combo.addItem(self._account_display_name(profile), profile.account_id)
         self.account_combo.currentIndexChanged.connect(self._account_changed)
         self.add_account_btn = _btn("添加账号", "helpBtn", root)
         self.add_account_btn.setToolTip("创建独立账号档案并扫码登录，不会启动领取")
@@ -179,7 +196,7 @@ class MainWindow(QMainWindow):
         subtitle.addSpacing(round(8 * theme.SCALE))
         subtitle.addWidget(self.login_status)
 
-        self.flow_hint = QLabel("① 复制领取界面的链接     →     ② 点击「先登录」完成扫码     →     ③ 手动开始 / 定时执行")
+        self.flow_hint = QLabel("① 登录当前账号     →     ② 添加任务并设置参数     →     ③ 单条运行 / 全部开始    ·    配置自动保存")
         self.flow_hint.setWordWrap(True)
         self.flow_hint.setObjectName("flowHint")
 
@@ -205,14 +222,20 @@ class MainWindow(QMainWindow):
         self.log_text = QPlainTextEdit(root)
         self.log_text.setMaximumBlockCount(2000)
         self.log_text.setReadOnly(True)
-        self.log_text.setPlaceholderText("还没有运行记录\n\n第一次使用：点击「先登录」完成扫码，不会提交领取。\n已登录：在开放前手动开始，或从右侧选择定时执行。")
-        links_title = QLabel("领取链接")
+        self.log_text.setPlaceholderText("还没有运行记录\n\n首次使用：点击「登录当前账号」验证或扫码，不会提交领取。\n已登录：开放前手动开始，或选择定时执行。")
+        links_title = QLabel("领取任务")
         _css(links_title, "sectionTitle")
-        links_hint = QLabel("从具体奖励的领取 / 兑换界面复制完整链接，通常包含 task_id；每行一个任务，点击 + 添加。")
+        links_hint = QLabel("粘贴带 task_id 的领取链接；点「设置」编辑该任务，勾选参与全部开始。")
         links_hint.setWordWrap(True)
         _css(links_hint, "dim")
         log_title = QLabel("运行记录与领取结果")
         _css(log_title, "sectionTitle")
+        self.settings_panel = SettingsPanel(QSettings(os.path.join(self.service.paths.data_dir, "ui.ini"), QSettings.IniFormat), root)
+        task_toolbar = self._build_workspace_tools()
+        log_header = QHBoxLayout()
+        log_header.addWidget(log_title)
+        log_header.addStretch()
+        log_header.addWidget(self.log_filter)
 
         # Root layout
         layout = QVBoxLayout(root)
@@ -228,10 +251,10 @@ class MainWindow(QMainWindow):
         left.setSpacing(round(9 * theme.SCALE))
         left.addWidget(links_title)
         left.addWidget(links_hint)
+        left.addLayout(task_toolbar)
         left.addWidget(self.link_scroll)
-        left.addWidget(log_title)
+        left.addLayout(log_header)
         left.addWidget(self.log_text, 1)
-        self.settings_panel = SettingsPanel(QSettings(os.path.join(self.service.paths.data_dir, "ui.ini"), QSettings.IniFormat), root)
         body.addLayout(left, 1)
         body.addWidget(self.settings_panel)
         layout.addLayout(body, 1)
@@ -240,6 +263,12 @@ class MainWindow(QMainWindow):
         self.account_combo.blockSignals(True)
         self.account_combo.setCurrentIndex(self.account_combo.findData(account_id))
         self.account_combo.blockSignals(False)
+
+    def _account_display_name(self, profile: AccountProfile) -> str:
+        if (profile.account_id != DEFAULT_ACCOUNT
+                and not os.path.exists(get_runtime_paths(self.service.base_dir, profile.account_id).cookie_file)):
+            return f"{profile.name}（待登录）"
+        return profile.name
 
     def _account_changed(self, index: int) -> None:
         account_id = self.account_combo.itemData(index)
@@ -259,6 +288,9 @@ class MainWindow(QMainWindow):
             raise ValueError("账号不存在")
         if account_id == self.service.account_id:
             return
+        self._save_timer.stop()
+        if not self._loading_workspace:
+            self._autosave_workspace()
         new_service = RewardService(self.service.base_dir, account_id=account_id)
         try:
             self.settings_panel.save()
@@ -266,11 +298,19 @@ class MainWindow(QMainWindow):
             pass
         self.service.close()
         self.service = new_service
+        self._loading_workspace = True
         self.settings_panel.load_preferences(QSettings(os.path.join(new_service.paths.data_dir, "ui.ini"), QSettings.IniFormat))
         self._settings.setValue("accounts/active_id", account_id)
         self._settings.sync()
         self.log_text.clear()
-        self._on_login_checked(False, "本地登录待验证" if os.path.exists(new_service.paths.cookie_file) else "尚未登录")
+        self._log_history.clear()
+        self._load_workspace()
+        if os.path.exists(new_service.paths.cookie_file):
+            self._on_login_checked(False, "本地登录待验证")
+        elif account_id != DEFAULT_ACCOUNT:
+            self._on_login_checked(False, "账号待登录")
+        else:
+            self._on_login_checked(False, "尚未登录")
         self.set_batch_status(self.STATUS_IDLE, "dim")
         self._row_claim_stage_active.clear()
         for row in self.link_rows:
@@ -281,7 +321,7 @@ class MainWindow(QMainWindow):
             self.guide.hide()
         name = next(profile.name for profile in self._account_profiles if profile.account_id == account_id)
         self.setWindowTitle(f"Bilibili Live Reward · {name}")
-        self.append_ui_log(f"[账号] 已切换到「{name}」，Cookie、日志和运行设置独立；当前链接保留，需手动开始")
+        self.append_ui_log(f"[账号] 已切换到「{name}」，登录、任务配置和日志独立；需手动开始")
 
     def add_account(self) -> None:
         if self._is_running or self._closing or self._account_error:
@@ -300,7 +340,7 @@ class MainWindow(QMainWindow):
         added = self.account_store.add(name)
         self._account_profiles = self.account_store.list_profiles()
         self.account_combo.blockSignals(True)
-        self.account_combo.addItem(added.name, added.account_id)
+        self.account_combo.addItem(self._account_display_name(added), added.account_id)
         self.account_combo.blockSignals(False)
         self._activate_account(added.account_id)
         self.start_login()
@@ -321,10 +361,16 @@ class MainWindow(QMainWindow):
         self.link_scroll.ensureWidgetVisible(self.link_rows[0].input)
         if self.guide is not None:
             self.guide.deleteLater()
+        account_step_title = "确认当前账号" if self._login_verified else "选择账号并登录"
+        account_step_body = (
+            "当前账号已验证。切换账号后需要重新验证；添加另一账号用旁边的「添加账号」。"
+            if self._login_verified
+            else "点「登录当前账号」验证或扫码，不会提交领取。添加另一账号用旁边的「添加账号」；各账号的登录和设置独立，运行期间不能切换。"
+        )
         self.guide = OnboardingOverlay(self.centralWidget(), [
-            (self.link_rows[0].input, "粘贴领取链接", "复制具体奖励的领取 / 兑换页链接，地址需带 task_id。活动首页或直播间链接不能代替。每行一条，点 + 添加。"),
-            (self.account_combo, "选账号，先登录", "点「先登录」扫码，不会提交领取。加账号用旁边的「添加账号」；各账号的登录和设置独立，运行期间不能切换。"),
-            (self.settings_panel.mode, "设好方式，再开始", "右侧可选次数、时长或定时。定时默认北京时间 00:00 + 100 ms，自动校时；抖动可选，并发默认关闭。\n\n设好后点「全部开始」。定时请提前扫码，并保持电脑唤醒、联网。"),
+            (self.link_rows[0].input, "添加领取任务", "粘贴具体奖励的领取 / 兑换页链接，地址需带 task_id。可给任务起名；勾选的任务参与「全部开始」。"),
+            (self.account_combo, account_step_title, account_step_body),
+            (self.settings_panel.mode, "每条任务，独立设置", "点任务的「设置」，右侧选次数、时长或定时，再点「运行」单跑。定时默认北京时间 00:00 + 100 ms，需提前登录并保持电脑唤醒。\n\n配置自动保存，可存模板复用；并发与最小间隔在全局设置中调整。"),
             (self.log_text, "结果看这里，随时停止", "扫码成功不等于领取成功，兑换码会显示在这里。无资格会继续尝试，IP 异常会停止。可逐条取消或点「全部停止」，教程随时可重看。"),
         ])
         self.guide.dismissed.connect(self._save_tutorial_preference)
@@ -337,7 +383,8 @@ class MainWindow(QMainWindow):
             self.append_ui_log("[教程] 无法保存偏好，下次启动可能再次显示教程")
 
     # ── Row management ──────────────────────────────────
-    def _create_link_row(self, text: str = "") -> LinkRowWidgets:
+    def _create_link_row(self, text: str = "", config: SavedTask | None = None) -> LinkRowWidgets:
+        config = config or SavedTask(name=f"任务 {len(self.link_rows) + 1}", url=text)
         frame = QFrame(self.centralWidget())
         _css(frame, "card")
 
@@ -347,15 +394,34 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         card_layout.addLayout(row)
         row.setSpacing(round(12 * theme.SCALE))
+        enabled = QCheckBox()
+        enabled.setChecked(config.enabled)
+        enabled.setAccessibleName("参与全部开始")
+        enabled.setToolTip("勾选后参与全部开始；不影响单条运行")
+        row.addWidget(enabled)
 
         idx = QLabel()
         _css(idx, "indexLabel")
-        idx.setFixedWidth(round(68 * theme.SCALE))
+        idx.setFixedWidth(round(28 * theme.SCALE))
         idx.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         row.addWidget(idx)
+        name_edit = QLineEdit(config.name)
+        name_edit.setMaxLength(48)
+        name_edit.setPlaceholderText("任务名称")
+        name_edit.setAccessibleName("任务名称")
+        name_edit.setProperty("cssClass", "taskName")
+        row.addWidget(name_edit, 1)
+        status_lbl = QLabel(self.STATUS_IDLE)
+        _css(status_lbl, "dim")
+        status_lbl.setMinimumWidth(round(64 * theme.SCALE))
+        status_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+        row.addWidget(status_lbl)
+        row = QHBoxLayout()
+        row.setSpacing(round(8 * theme.SCALE))
+        card_layout.addLayout(row)
 
         inp = QLineEdit()
-        inp.setText(text)
+        inp.setText(config.url)
         inp.setPlaceholderText("输入兑换链接，如 https://www.bilibili.com/blackboard/era/award-exchange.html?task_id=...")
         row.addWidget(inp, 1)
 
@@ -367,7 +433,14 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         card_layout.addLayout(row)
-        row.addStretch()
+        summary = QLabel()
+        summary.setProperty("cssClass", "taskSummary")
+        row.addWidget(summary, 1)
+        settings_btn = _btn("设置", "taskAction", frame)
+        row.addWidget(settings_btn)
+        run_btn = _btn("运行", "taskRun", frame)
+        run_btn.setToolTip("只运行这一条任务，使用本任务的设置")
+        row.addWidget(run_btn)
 
         pause_btn = _btn("暂停", "pauseBtn", frame)
         row.addWidget(pause_btn)
@@ -378,17 +451,13 @@ class MainWindow(QMainWindow):
         cancel_btn = _btn("取消", "cancelBtn", frame)
         row.addWidget(cancel_btn)
 
-        status_lbl = QLabel(self.STATUS_IDLE)
-        _css(status_lbl, "dim")
-        status_lbl.setFixedWidth(round(64 * theme.SCALE))
-        status_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignCenter)
-        row.addWidget(status_lbl)
-
         rw = LinkRowWidgets(
             frame=frame, index_label=idx, input=inp,
             add_btn=add_btn, remove_btn=rem_btn,
             pause_btn=pause_btn, resume_btn=resume_btn,
             cancel_btn=cancel_btn, status_label=status_lbl,
+            config=config, name_edit=name_edit, enabled=enabled, summary=summary,
+            run_btn=run_btn, settings_btn=settings_btn,
         )
 
         add_btn.clicked.connect(lambda: self.add_link_row(after_row=rw))
@@ -396,37 +465,79 @@ class MainWindow(QMainWindow):
         pause_btn.clicked.connect(lambda: self.pause_claim(rw))
         resume_btn.clicked.connect(lambda: self.resume_claim(rw))
         cancel_btn.clicked.connect(lambda: self.cancel_claim(rw))
+        run_btn.clicked.connect(lambda: self.start_claim(only_row=rw))
+        settings_btn.clicked.connect(lambda: self.select_task(rw))
+        inp.textChanged.connect(lambda: self._task_text_changed(rw))
+        name_edit.textChanged.connect(lambda: self._task_text_changed(rw))
+        enabled.toggled.connect(lambda: self._task_text_changed(rw))
+        self._update_task_summary(rw)
+        for widget in (frame, inp, name_edit):
+            widget.setProperty("taskKey", config.key)
+            widget.installEventFilter(self)
 
         return rw
 
-    def add_link_row(self, *, after_row: LinkRowWidgets | None = None, text: str = "") -> None:
-        new_row = self._create_link_row(text)
+    def add_link_row(self, *, after_row: LinkRowWidgets | None = None, text: str = "", config: SavedTask | None = None) -> None:
+        if self._is_running or len(self.link_rows) >= 100:
+            return
+        new_row = self._create_link_row(text, config)
         idx = self.link_rows.index(after_row) + 1 if after_row else len(self.link_rows)
         self.link_rows.insert(idx, new_row)
         self.rows_wrap.insertWidget(idx, new_row.frame)
         self._refresh_link_rows()
+        if not self._loading_workspace:
+            self.select_task(new_row)
+            self._queue_workspace_save()
 
     def remove_link_row(self, row: LinkRowWidgets) -> None:
         if self._is_running or len(self.link_rows) <= 1:
             return
+        if row is self._selected_row:
+            self._selected_row = None
         self.link_rows.remove(row)
         self.rows_wrap.removeWidget(row.frame)
         row.frame.deleteLater()
         self._refresh_link_rows()
+        if self._selected_row is None:
+            self.select_task(self.link_rows[0], commit=False)
+        self._queue_workspace_save()
 
     def _refresh_link_rows(self) -> None:
         for i, rw in enumerate(self.link_rows):
-            rw.index_label.setText(f"链接 {i + 1}")
+            rw.index_label.setText(f"{i + 1:02d}")
             rw.input.setEnabled(not self._is_running)
             rw.add_btn.setEnabled(not self._is_running)
             rw.remove_btn.setEnabled(not self._is_running and len(self.link_rows) > 1)
+            rw.name_edit.setEnabled(not self._is_running)
+            rw.enabled.setEnabled(not self._is_running)
             self._sync_row_action_buttons(i)
         # Fit a single row snugly; extra links scroll instead of squeezing the log.
         content_height = sum(rw.frame.sizeHint().height() for rw in self.link_rows)
         content_height += self.rows_wrap.spacing() * max(0, len(self.link_rows) - 1)
-        self.link_scroll.setFixedHeight(min(content_height + 2, round(230 * theme.SCALE)))
+        maximum = round(220 * theme.SCALE)
+        if self.link_scroll.y() > 0:
+            # Keep room for the log header and log even at the minimum window size.
+            maximum = min(maximum, max(round(100 * theme.SCALE),
+                          self.centralWidget().height() - self.link_scroll.y() - round(150 * theme.SCALE)))
+        self.link_scroll.setFixedHeight(min(content_height + 2, maximum))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "link_scroll"):
+            QTimer.singleShot(0, self._refresh_link_rows)
 
     # ── URL parsing ─────────────────────────────────────
+    def eventFilter(self, watched, event):
+        if (event.type() in (QEvent.FocusIn, QEvent.MouseButtonPress)
+                and not self._loading_workspace):
+            key = watched.property("taskKey")
+            if key:
+                for row in self.link_rows:
+                    if row.config.key == key:
+                        self.select_task(row, quiet=True)
+                        break
+        return super().eventFilter(watched, event)
+
     @staticmethod
     def _parse_task_id_from_url(task_url: str) -> str:
         parsed = urlparse(task_url)
@@ -434,33 +545,39 @@ class MainWindow(QMainWindow):
         ids = qs.get("task_id") or qs.get("taskId")
         return ids[0].strip() if ids else ""
 
-    def _collect_link_tasks(self) -> list[LinkTaskItem]:
+    def _collect_link_tasks(self, only_row: LinkRowWidgets | None = None) -> list[LinkTaskItem]:
+        self._commit_selected_task()
         tasks: list[LinkTaskItem] = []
         for i, rw in enumerate(self.link_rows):
+            if only_row is not None and rw is not only_row:
+                continue
+            if only_row is None and not rw.enabled.isChecked():
+                continue
             url = rw.input.text().strip()
             if not url:
                 continue
             tid = self._parse_task_id_from_url(url)
             if not tid:
                 raise ValueError(f"第 {i + 1} 条领取链接无效，未解析到 task_id。")
-            tasks.append(LinkTaskItem(index=i, task_url=url, task_id=tid))
+            tasks.append(LinkTaskItem(index=i, task_url=url, task_id=tid,
+                                      settings=with_globals(rw.config.settings, self._global_settings)))
         return tasks
 
     # ── Claim flow ──────────────────────────────────────
-    def start_claim(self) -> None:
+    def start_claim(self, *, only_row: LinkRowWidgets | None = None) -> None:
         if self._is_running:
             self.append_ui_log("[批次] 批次任务进行中，请勿重复点击")
             return
 
         try:
-            link_tasks = self._collect_link_tasks()
+            link_tasks = self._collect_link_tasks(only_row)
             settings = self.settings_panel.snapshot()
         except ValueError as exc:
             QMessageBox.warning(self, "链接或设置无效", str(exc))
             return
 
         if not link_tasks:
-            QMessageBox.warning(self, "领取链接为空", "请至少输入一条领取链接。")
+            QMessageBox.warning(self, "没有可运行任务", "请填写领取链接；全部开始还需要勾选任务。")
             return
 
         for rw in self.link_rows:
@@ -470,6 +587,7 @@ class MainWindow(QMainWindow):
             self.append_ui_log(f"[链接{task.index + 1}] [任务] task_id: {task.task_id}")
 
         self.settings_panel.save()
+        self._autosave_workspace()
         self._set_running(True)
         self.set_batch_status(self.STATUS_RUNNING, "primary")
         self._start_worker(ClaimWorker(self.service, link_tasks, settings))
@@ -483,6 +601,9 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "运行设置无效", str(exc))
             return
+        self._autosave_workspace()
+        self._login_checking = True
+        self._refresh_login_ui()
         self._set_running(True)
         self.set_batch_status("检查登录中", "primary")
         self.login_status.setText("正在检查登录…")
@@ -491,8 +612,32 @@ class MainWindow(QMainWindow):
         self._start_worker(worker)
 
     def _on_login_checked(self, success: bool, message: str) -> None:
+        self._login_checking = False
+        self._login_verified = success
         self.login_status.setText(message)
         self.login_status.setStyleSheet(f"color: {theme.GREEN if success else theme.TEXT_SUB};")
+        self._refresh_login_ui()
+
+    def _refresh_login_ui(self) -> None:
+        if self._login_checking:
+            self.login_btn.setText("检查中…")
+            self.login_btn.setToolTip("正在验证当前账号的登录状态")
+        elif self._login_verified:
+            self.login_btn.setText("检查登录")
+            self.login_btn.setToolTip("重新验证当前账号；登录已失效时会弹出二维码，不会提交领取")
+        else:
+            self.login_btn.setText("登录当前账号")
+            self.login_btn.setToolTip("验证当前账号的登录状态；未登录或已失效时会弹出二维码，不会提交领取")
+        self.product_hint.setText(
+            "BILIBILI  /  登录已验证，等待奖励开放后开始领取"
+            if self._login_verified
+            else "BILIBILI  /  登录当前账号后，等待奖励开放再开始领取"
+        )
+        self.flow_hint.setText(
+            "① 账号已就绪     →     ② 添加任务并设置参数     →     ③ 单条运行 / 全部开始    ·    配置自动保存"
+            if self._login_verified
+            else "① 登录当前账号     →     ② 添加任务并设置参数     →     ③ 单条运行 / 全部开始    ·    配置自动保存"
+        )
 
     def _register_logged_in_account(self) -> None:
         if self._account_error or not self.service.account_identity:
@@ -502,7 +647,7 @@ class MainWindow(QMainWindow):
             self._account_profiles = self.account_store.list_profiles()
             for profile in self._account_profiles:
                 index = self.account_combo.findData(profile.account_id)
-                self.account_combo.setItemText(index, profile.name)
+                self.account_combo.setItemText(index, self._account_display_name(profile))
                 self.account_combo.setItemData(index, profile.name, Qt.ToolTipRole)
             self.setWindowTitle(f"Bilibili Live Reward · {self.account_combo.currentText()}")
         except (BiliRewardError, ValueError, OSError) as exc:
@@ -536,9 +681,21 @@ class MainWindow(QMainWindow):
 
     # ── Logging ─────────────────────────────────────────
     def append_log(self, message: str) -> None:
-        self.log_text.appendPlainText(message)
-        if "扫码登录成功" in message or "登录状态验证通过" in message:
+        match = re.search(r"\[链接(\d+)\]", message)
+        task_key = None
+        if match:
+            index = int(match.group(1)) - 1
+            if 0 <= index < len(self.link_rows):
+                task_key = self.link_rows[index].config.key
+        self._log_history.append((task_key, message))
+        selected_key = self._selected_row.config.key if self._selected_row is not None else None
+        if (not hasattr(self, "log_filter") or self.log_filter.currentIndex() == 0
+                or task_key is None or task_key == selected_key):
+            self.log_text.appendPlainText(message)
+        if "登录状态验证通过" in message:
             self._on_login_checked(True, "登录已验证")
+        elif "扫码登录成功" in message:
+            self._on_login_checked(False, "扫码完成，验证登录中…")
         if self.qr_dialog and self.qr_dialog.isVisible() and "[登录]" in message:
             self.qr_dialog.set_status_text(message)
             if "扫码登录成功" in message:
@@ -555,11 +712,15 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self._is_running = running
+        self._refresh_login_ui()
         self.login_btn.setEnabled(not running)
         self.help_btn.setEnabled(not running)
         self.account_combo.setEnabled(not running and not self._account_error)
         self.add_account_btn.setEnabled(not running and not self._account_error)
         self.settings_panel.setEnabled(not running)
+        self._save_timer.stop()
+        for button in (self.new_task_btn, self.save_tasks_btn, self.import_tasks_btn, self.export_tasks_btn):
+            button.setEnabled(not running)
         self.stop_all_btn.setEnabled(running)
         if running and self.guide is not None:
             self.guide.hide()
@@ -575,6 +736,11 @@ class MainWindow(QMainWindow):
         rw = self.link_rows[link_index]
         st = rw.status_label.text()
         active = self._row_claim_stage_active.get(link_index, False)
+        rw.run_btn.setEnabled(not self._is_running and bool(rw.input.text().strip()))
+        rw.run_btn.setVisible(not self._is_running)
+        rw.pause_btn.setVisible(self._is_running and st != "已暂停")
+        rw.resume_btn.setVisible(self._is_running and st == "已暂停")
+        rw.cancel_btn.setVisible(self._is_running)
 
         rw.pause_btn.setEnabled(self._is_running and active and st == "抢奖中")
         rw.resume_btn.setEnabled(self._is_running and active and st == "已暂停")
@@ -642,8 +808,11 @@ class MainWindow(QMainWindow):
                 f"成功 {sc} 条\n失败 {fc} 条\n取消 {cc} 条")
 
     def on_worker_finished(self) -> None:
+        was_login_check = isinstance(self.worker, LoginWorker)
         self._register_logged_in_account()
         self._set_running(False)
+        if was_login_check:
+            self.set_batch_status(self.STATUS_IDLE, "dim")
         self._row_claim_stage_active.clear()
         self._current_qr_link_index = None
         for i in range(len(self.link_rows)):
@@ -652,6 +821,7 @@ class MainWindow(QMainWindow):
             self.qr_dialog.hide()
         self.worker_thread = None
         self.worker = None
+        self._queue_workspace_save()
         if self._closing:
             self.close()
 
@@ -669,5 +839,7 @@ class MainWindow(QMainWindow):
             self.settings_panel.save()
         except ValueError:
             self.append_ui_log("[设置] 无效设置未保存")
+        self._save_timer.stop()
+        self._autosave_workspace()
         self.service.close()
         super().closeEvent(event)

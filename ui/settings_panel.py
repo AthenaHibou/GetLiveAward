@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from PyQt5.QtCore import QSettings, Qt, QTime
+from PyQt5.QtCore import QSettings, Qt, QTime, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,11 +27,14 @@ from ui.controls import SoftComboBox
 class SettingsPanel(QWidget):
     """Persist user choices, then snapshot them at batch start."""
 
+    changed = pyqtSignal()
+
     def __init__(self, preferences: QSettings, parent=None) -> None:
         super().__init__(parent)
         self.preferences = preferences
-        self.setFixedWidth(round(255 * theme.SCALE))
-        title = QLabel("运行设置")
+        self._applying = False
+        self.setFixedWidth(round(270 * theme.SCALE))
+        self.title = title = QLabel("当前任务设置")
         title.setProperty("cssClass", "sectionTitle")
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -45,7 +48,7 @@ class SettingsPanel(QWidget):
         self.interval_ms.setRange(100, 60000)
         self.interval_ms.setSingleStep(100)
         self.interval_ms.setToolTip(
-            "全批次请求起始的最小间隔，也是领取失败后的等待间隔。1000 ms = 1 秒。"
+            "本任务的请求间隔与失败重试等待；实际还受账号全局最小间隔约束。1000 ms = 1 秒。"
         )
         form.addRow("间隔 / ms", self.interval_ms)
         self.mode = SoftComboBox()
@@ -76,7 +79,7 @@ class SettingsPanel(QWidget):
         self.after_label = QLabel("到点后")
         schedule_form.addRow(self.after_label, self.after_schedule)
         self.schedule_note = QLabel(
-            "按北京时间计算下一次时刻。点击「全部开始」提前准备，并保持电脑唤醒。等待时不提交领取，首发不加随机抖动。"
+            "按北京时间计算下一次时刻。点击「单条运行」或「全部开始」提前准备，并保持电脑唤醒。等待时不提交领取，首发不加随机抖动。"
         )
         self.schedule_note.setWordWrap(True)
         schedule_form.addRow(self.schedule_note)
@@ -123,6 +126,17 @@ class SettingsPanel(QWidget):
         self.jitter_label = QLabel("额外抖动 / ms")
         form.addRow(self.jitter_label, self.jitter_ms)
         self.sync = QCheckBox("启用时间同步")
+        global_title = QLabel("账号全局设置")
+        global_title.setProperty("cssClass", "sectionTitle")
+        form.addRow(global_title)
+        global_note = QLabel("所有任务共用；实际间隔取任务与全局设置中较大值。")
+        global_note.setWordWrap(True)
+        global_note.setStyleSheet(f"color: {theme.TEXT_SUB};")
+        form.addRow(global_note)
+        self.global_interval_ms = QSpinBox()
+        self.global_interval_ms.setRange(100, 60000)
+        self.global_interval_ms.setSingleStep(100)
+        form.addRow("最小间隔 / ms", self.global_interval_ms)
         form.addRow(self.sync)
         self.sync_group = QWidget()
         sync_form = QFormLayout(self.sync_group)
@@ -188,9 +202,25 @@ class SettingsPanel(QWidget):
             )
             signal.connect(self._update_controls)
         self._update_controls()
+        for control in (self.interval_ms, self.mode, self.after_schedule, self.schedule_time,
+                        self.start_delay, self.max_retry, self.duration, self.timeout_ms,
+                        self.sold_out, self.jitter, self.jitter_ms, self.sync, self.server,
+                        self.sync_interval, self.concurrent, self.requests, self.parallel_links,
+                        self.links, self.global_interval_ms):
+            signal = (control.currentIndexChanged if isinstance(control, QComboBox)
+                      else control.toggled if isinstance(control, QCheckBox)
+                      else control.textChanged if isinstance(control, QLineEdit)
+                      else control.timeChanged if isinstance(control, QTimeEdit)
+                      else control.valueChanged)
+            signal.connect(self._emit_changed)
+
+    def _emit_changed(self, *args) -> None:
+        if not self._applying:
+            self.changed.emit()
 
     def snapshot(self) -> RunSettings:
         return RunSettings(
+            global_interval_ms=self.global_interval_ms.value(),
             concurrent=self.concurrent.isChecked(),
             request_workers=self.requests.value(),
             parallel_links=self.parallel_links.isChecked(),
@@ -232,6 +262,8 @@ class SettingsPanel(QWidget):
             self.apply(defaults)
 
     def apply(self, settings: RunSettings) -> None:
+        self._applying = True
+        self.global_interval_ms.setValue(settings.global_interval_ms)
         self.interval_ms.setValue(settings.interval_ms)
         self.mode.setCurrentIndex(self.mode.findData(settings.retry_mode))
         self.max_retry.setValue(settings.max_retry)
@@ -255,6 +287,8 @@ class SettingsPanel(QWidget):
         self.parallel_links.setChecked(settings.parallel_links)
         self.links.setValue(settings.link_workers)
         self._update_controls()
+        self._applying = False
+        self.changed.emit()
 
     def _update_controls(self) -> None:
         mode = self.mode.currentData()

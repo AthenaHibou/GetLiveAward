@@ -106,6 +106,41 @@ QPushButton[cssClass="primary"]:disabled {{
     background-color: #C8EAF5;
     color: #8CCFDF;
 }}
+QPushButton[cssClass="batchStart"], QPushButton[cssClass="taskRun"] {{
+    background: {BLUE};
+    color: #FFFFFF;
+    border: 1px solid {BLUE};
+    border-radius: {_scale(s, 10)};
+    font-weight: 600;
+    padding: {_scale(s, 7)} {_scale(s, 17)};
+}}
+QPushButton[cssClass="batchStart"]:hover, QPushButton[cssClass="taskRun"]:hover {{
+    background: {BLUE_HOVER};
+}}
+QPushButton[cssClass="batchStart"]:disabled, QPushButton[cssClass="taskRun"]:disabled {{
+    background: #DCEFF5;
+    border-color: #DCEFF5;
+    color: #8CBBC9;
+}}
+QPushButton[cssClass="taskAction"], QPushButton[cssClass="taskRun"] {{
+    font-size: {_scale(s, 12)};
+    padding: {_scale(s, 5)} {_scale(s, 13)};
+}}
+QLineEdit[cssClass="taskName"] {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {_scale(s, 6)};
+    padding: {_scale(s, 3)} {_scale(s, 6)};
+    font-weight: 600;
+}}
+QLineEdit[cssClass="taskName"]:focus {{
+    background: #FFFFFF;
+    border-color: {BLUE};
+}}
+QLabel[cssClass="taskSummary"] {{
+    font-size: {_scale(s, 12)};
+    color: {TEXT_SUB};
+}}
 
 /* Icon buttons (+/-) */
 QPushButton[cssClass="iconBtn"] {{
@@ -341,6 +376,10 @@ QFrame[cssClass="card"] {{
     border: 1.5px solid {BORDER};
     border-radius: {_scale(s, 14)};
     padding: {_scale(s, 14)};
+}}
+QFrame[cssClass="card"][selectedTask="true"] {{
+    border-color: #A9DDEA;
+    background: #FCFEFF;
 }}
 
 QFrame[cssClass="sep"] {{
