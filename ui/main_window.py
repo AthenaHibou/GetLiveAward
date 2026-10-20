@@ -137,7 +137,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         self.setCentralWidget(root)
 
         # Header
-        title = QLabel("直播奖励领取")
+        title = QLabel("直播激励领取")
         _css(title, "title")
 
         self.help_btn = _btn("使用教程", "helpBtn", root)
