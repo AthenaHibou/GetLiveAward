@@ -290,7 +290,8 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
             return
         self._save_timer.stop()
         if not self._loading_workspace:
-            self._autosave_workspace()
+            if not self._workspace_error and not self._autosave_workspace():
+                raise ValueError("当前账号的配置未保存，请修正设置或检查文件写入权限后再切换账号")
         new_service = RewardService(self.service.base_dir, account_id=account_id)
         try:
             self.settings_panel.save()

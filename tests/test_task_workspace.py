@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMessageBox
 from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
 
@@ -160,6 +160,70 @@ class WorkspaceTests(unittest.TestCase):
         window.account_combo.setCurrentIndex(window.account_combo.findData("default"))
         self.assertEqual(window.link_rows[0].config.name, "原账号任务")
         self.assertIn("task_id=a", window.link_rows[0].input.text())
+
+    def test_template_delete_button_removes_only_chosen_template_after_restart(self):
+        window = self.window
+        self.assertFalse(window.delete_template_btn.isEnabled())
+        window.settings_panel.max_retry.setValue(9)
+        window.save_template_named("九次")
+        window.settings_panel.max_retry.setValue(20)
+        window.save_template_named("二十次")
+        self.assertTrue(window.delete_template_btn.isEnabled())
+        with (patch("ui.task_workspace.QInputDialog.getItem", return_value=("九次", True)),
+              patch("ui.task_workspace.QMessageBox.question", return_value=QMessageBox.Yes)):
+            window.delete_template_btn.click()
+        self.assertEqual(window.settings_panel.snapshot().max_retry, 20)
+        self.assertEqual(set(load_document(window._workspace_path()).templates), {"二十次"})
+        window.close()
+        reopened = MainWindow(RewardService(self.temp.name))
+        self.addCleanup(reopened.close)
+        self.assertEqual(set(reopened._templates), {"二十次"})
+        reopened.delete_template_named("二十次")
+        self.assertEqual(reopened.template_combo.count(), 1)
+        self.assertFalse(reopened.delete_template_btn.isEnabled())
+
+    def test_template_delete_cancellation_and_write_failure_keep_templates(self):
+        window = self.window
+        window.save_template_named("保留")
+        self.assertTrue(window._autosave_workspace())
+        with (patch("ui.task_workspace.QInputDialog.getItem", return_value=("保留", True)),
+              patch("ui.task_workspace.QMessageBox.question", return_value=QMessageBox.No)):
+            window.delete_template_btn.click()
+        self.assertIn("保留", window._templates)
+        with patch("ui.task_workspace.save_document", side_effect=OSError("无法写入")):
+            with self.assertRaises(OSError):
+                window.delete_template_named("保留")
+        self.assertIn("保留", window._templates)
+        self.assertIn("保留", load_document(window._workspace_path()).templates)
+        window._set_running(True)
+        with self.assertRaises(ValueError):
+            window.delete_template_named("保留")
+        window._set_running(False)
+
+    def test_global_interval_updates_unselected_task_summary(self):
+        window = self.window
+        first = window.link_rows[0]
+        window.settings_panel.interval_ms.setValue(700)
+        window.add_link_row()
+        window.settings_panel.global_interval_ms.setValue(1500)
+        self.assertIn("1500 ms", first.summary.text())
+        self.assertIn("全局最小间隔 1500 ms", first.summary.toolTip())
+        window.select_task(first)
+        window.settings_panel.global_interval_ms.setValue(500)
+        window.select_task(window.link_rows[1])
+        self.assertIn("700 ms", first.summary.text())
+
+    def test_account_switch_keeps_unsaved_edits_on_write_failure(self):
+        window = self.window
+        added = window.account_store.add("另一个账号")
+        window._account_profiles = window.account_store.list_profiles()
+        window.link_rows[0].name_edit.setText("不能丢失的修改")
+        original_service = window.service
+        with patch("ui.task_workspace.save_document", side_effect=OSError("无法写入")):
+            with self.assertRaisesRegex(ValueError, "未保存"):
+                window._activate_account(added.account_id)
+        self.assertIs(window.service, original_service)
+        self.assertEqual(window.link_rows[0].config.name, "不能丢失的修改")
 
     def test_corrupt_config_is_preserved_and_bad_import_does_not_clear_tasks(self):
         path = self.window._workspace_path()

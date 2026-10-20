@@ -8,7 +8,7 @@ from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QFileDialog, QHBoxLayout, QInputDialog, QMessageBox, QPushButton
 
 from core.clock_sync import BEIJING, next_scheduled_time
-from core.task_config import SavedTask, TaskDocument, load_document, save_document, with_globals
+from core.task_config import GLOBAL_FIELDS, SavedTask, TaskDocument, load_document, save_document, with_globals
 from ui.controls import SoftComboBox
 
 
@@ -39,16 +39,21 @@ class TaskWorkspaceMixin:
             toolbar.addWidget(button)
         toolbar.addStretch()
         self.template_combo = SoftComboBox()
-        self.template_combo.addItem("套用参数模板…", None)
+        self.template_combo.addItem("套用模板…", None)
         self.template_combo.setToolTip("只复制当前任务的参数；不会替换链接或全局设置")
         self.template_combo.currentIndexChanged.connect(self._apply_template)
         self.save_template_btn = QPushButton("存模板")
         self.save_template_btn.setToolTip("将当前任务参数另存为模板，不含链接与全局设置")
         self.save_template_btn.setStyleSheet("padding: 6px 9px;")
         self.save_template_btn.clicked.connect(self._save_template)
+        self.delete_template_btn = QPushButton("删模板")
+        self.delete_template_btn.setToolTip("选择并删除当前账号保存的参数模板，不影响已套用的任务")
+        self.delete_template_btn.setStyleSheet("padding: 6px 9px;")
+        self.delete_template_btn.clicked.connect(self._delete_template)
         template_tools = QHBoxLayout()
         template_tools.addWidget(self.template_combo, 1)
         template_tools.addWidget(self.save_template_btn)
+        template_tools.addWidget(self.delete_template_btn)
         self.settings_panel.layout().insertLayout(1, template_tools)
         self.log_filter = SoftComboBox()
         self.log_filter.addItems(["全部日志", "当前任务"])
@@ -88,9 +93,12 @@ class TaskWorkspaceMixin:
     def _commit_selected_task(self):
         if self._selected_row is not None and not self._loading_workspace:
             settings = self.settings_panel.snapshot()
+            globals_changed = any(getattr(settings, key) != getattr(self._global_settings, key)
+                                  for key in GLOBAL_FIELDS)
             self._global_settings = settings
             self._selected_row.config.settings = settings
-            self._update_task_summary(self._selected_row)
+            for row in self.link_rows if globals_changed else [self._selected_row]:
+                self._update_task_summary(row)
 
     def select_task(self, row, *, commit=True, quiet=False):
         if self._loading_workspace or row not in self.link_rows:
@@ -143,7 +151,7 @@ class TaskWorkspaceMixin:
         self._queue_workspace_save()
 
     def _update_task_summary(self, row):
-        settings = row.config.settings
+        settings = with_globals(row.config.settings, self._global_settings)
         mode = settings.effective_retry_mode
         limit = f"{settings.max_retry} 次" if mode == "count" else f"{settings.duration_minutes:g} 分钟" if mode == "duration" else "持续尝试"
         timing = f" · {settings.scheduled_time}" if settings.retry_mode == "scheduled" else ""
@@ -189,10 +197,11 @@ class TaskWorkspaceMixin:
     def _reload_templates(self):
         self.template_combo.blockSignals(True)
         self.template_combo.clear()
-        self.template_combo.addItem("套用参数模板…", None)
+        self.template_combo.addItem("套用模板…", None)
         for name in self._templates:
             self.template_combo.addItem(name, name)
         self.template_combo.blockSignals(False)
+        self.delete_template_btn.setEnabled(bool(self._templates))
 
     def save_template_named(self, name):
         name = name.strip()
@@ -213,6 +222,39 @@ class TaskWorkspaceMixin:
                 self.save_template_named(name)
             except ValueError as exc:
                 QMessageBox.warning(self, "模板未保存", str(exc))
+
+    def delete_template_named(self, name):
+        if self._is_running:
+            raise ValueError("运行期间不能删除模板")
+        if self._workspace_error:
+            raise ValueError("原配置读取失败，请修复文件或导入有效配置后再删除模板")
+        if name not in self._templates:
+            raise ValueError("模板不存在")
+        document = self._document()
+        del document.templates[name]
+        # Persist first so a failed write leaves the template available to retry.
+        save_document(self._workspace_path(), document)
+        self._templates = document.templates
+        self._reload_templates()
+        self.append_ui_log(f"[模板] 已删除「{name}」，已套用的任务参数保持不变")
+
+    def _delete_template(self):
+        if self._is_running or not self._templates:
+            return
+        name, accepted = QInputDialog.getItem(
+            self, "删除参数模板", "选择要删除的模板：", list(self._templates), 0, False
+        )
+        if not accepted:
+            return
+        answer = QMessageBox.question(
+            self, "删除参数模板", f"确定删除模板「{name}」？已套用的任务参数不受影响。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            try:
+                self.delete_template_named(name)
+            except (ValueError, OSError, UnicodeError) as exc:
+                QMessageBox.warning(self, "模板未删除", str(exc))
 
     def _apply_template(self, index):
         name = self.template_combo.itemData(index)
