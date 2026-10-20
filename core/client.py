@@ -349,7 +349,7 @@ class BiliRewardClient:
         *,
         award_info: AwardInfo | None = None,
         thread_count: int = 1,
-        max_retry: int | None = 120,
+        max_retry: int | None = 60,
         retry_interval: float = 1.0,
         log_callback: OptionalLogCallback = None,
         claim_control: ClaimExecutionControl | None = None,

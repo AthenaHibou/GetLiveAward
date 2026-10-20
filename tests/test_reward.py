@@ -506,7 +506,7 @@ class ServiceTests(unittest.TestCase):
         options = settings.claim_options("task")
         self.assertEqual(
             (options.thread_count, options.max_retry, options.retry_interval),
-            (1, 120, 1.0),
+            (1, 60, 1.0),
         )
         disabled = RunSettings(parallel_links=True, request_workers=4, link_workers=4)
         self.assertEqual((disabled.active_links, disabled.active_requests), (1, 1))

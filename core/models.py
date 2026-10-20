@@ -23,7 +23,7 @@ class AwardInfo:
 class ClaimOptions:
     task_id: str
     thread_count: int = 1
-    max_retry: int | None = 120
+    max_retry: int | None = 60
     retry_interval: float = 1.0
     timeout: float = 10.0
     stop_sold_out: bool = True
@@ -58,7 +58,7 @@ class RunSettings:
     link_workers: int = 2
     interval_ms: int = 1000
     retry_mode: str = "count"
-    max_retry: int = 120
+    max_retry: int = 60
     duration_minutes: float = 5.0
     timeout: float = 10.0
     stop_sold_out: bool = True
