@@ -159,6 +159,22 @@ class SettingsPanel(QWidget):
         self.sync_status.setStyleSheet(f"color: {theme.TEXT_SUB};")
         sync_form.addRow(self.sync_status)
         form.addRow(self.sync_group)
+        risk_title = QLabel("风控处理")
+        risk_title.setProperty("cssClass", "sectionTitle")
+        form.addRow(risk_title)
+        self.ignore_risk_control = QCheckBox("无视风控继续尝试")
+        self.ignore_risk_control.setToolTip(
+            "默认关闭：遇到 IP 异常、风控错误或 HTTP 412/429 时停止当前任务。\n\n"
+            "开启后仍按执行间隔重试，可能导致风控加剧。"
+            "领取仍受尝试次数、执行时长和手动停止约束；准备请求只在有限时间内重试。\n\n"
+            "-702/-705 等请求频率错误默认会重试，无需开启此项。"
+        )
+        form.addRow(self.ignore_risk_control)
+        risk_style = f"color: {theme.RED}; background: #FFF0ED; padding: 8px; border-radius: 6px;"
+        risk_warning = QLabel("警告：开启后可能导致风控加剧。")
+        risk_warning.setWordWrap(True)
+        risk_warning.setStyleSheet(risk_style)
+        form.addRow(risk_warning)
         concurrency_title = QLabel("并发设置 · 高风险")
         concurrency_title.setProperty("cssClass", "sectionTitle")
         form.addRow(concurrency_title)
@@ -171,9 +187,7 @@ class SettingsPanel(QWidget):
             "如果你不清楚会有什么后果，请勿变动此项。"
         )
         self.risk_note.setWordWrap(True)
-        self.risk_note.setStyleSheet(
-            f"color: {theme.RED}; background: #FFF0ED; padding: 8px; border-radius: 6px;"
-        )
+        self.risk_note.setStyleSheet(risk_style)
         concurrency_form.addRow(self.risk_note)
         self.parallel_links = QCheckBox("多任务异步派发（不等待响应）")
         self.parallel_links.setToolTip(
@@ -220,7 +234,7 @@ class SettingsPanel(QWidget):
         self.warning.setWordWrap(True)
         concurrency_form.addRow(self.warning)
         form.addRow(self.concurrency_group)
-        note = QLabel("单条失败或限流只停止自身，其他任务继续；成功后停止重复领取。")
+        note = QLabel("频率过高会按设置重试；风控默认只停止当前任务，其他任务继续；成功后停止重复领取。")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {theme.TEXT_SUB};")
         form.addRow(note)
@@ -266,7 +280,7 @@ class SettingsPanel(QWidget):
                         self.start_delay, self.max_retry, self.duration, self.timeout_ms,
                         self.sold_out, self.jitter, self.jitter_ms, self.sync, self.server,
                         self.sync_interval, self.concurrent, self.async_dispatch, self.requests, self.global_requests, self.parallel_links,
-                        self.links, self.global_interval_ms):
+                        self.links, self.global_interval_ms, self.ignore_risk_control):
             signal = (control.currentIndexChanged if isinstance(control, QComboBox)
                       else control.toggled if isinstance(control, QCheckBox)
                       else control.textChanged if isinstance(control, QLineEdit)
@@ -283,6 +297,7 @@ class SettingsPanel(QWidget):
             global_interval_ms=self.global_interval_ms.value(),
             concurrent=self.concurrent.isChecked(),
             async_dispatch=self.async_dispatch.isChecked(),
+            ignore_risk_control=self.ignore_risk_control.isChecked(),
             request_workers=self.requests.value(),
             global_request_workers=self.global_requests.value(),
             parallel_links=self.parallel_links.isChecked(),
@@ -346,6 +361,7 @@ class SettingsPanel(QWidget):
         )
         self.concurrent.setChecked(settings.concurrent)
         self.async_dispatch.setChecked(settings.async_dispatch)
+        self.ignore_risk_control.setChecked(settings.ignore_risk_control)
         self.requests.setValue(settings.request_workers)
         self.global_requests.setValue(settings.global_request_workers)
         self.parallel_links.setChecked(settings.parallel_links)
