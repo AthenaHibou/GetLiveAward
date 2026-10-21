@@ -451,6 +451,7 @@ class LoginWorker(ClaimWorker):
                 qr_callback=lambda qr: self.qr_code_ready.emit(-1, qr),
                 cancel_check=self._is_login_cancelled,
                 timeout=self.settings.timeout,
+                ignore_risk_control=self.settings.ignore_risk_control,
             )
             self.login_checked.emit(True, "登录已验证")
             self.status_changed.emit("登录就绪")

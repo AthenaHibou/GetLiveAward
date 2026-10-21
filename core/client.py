@@ -25,6 +25,7 @@ from .errors import (
     BiliCookieInvalidError,
     BiliRateLimitError,
     BiliRequestError,
+    BiliRetryableResponseError,
     BiliRewardCancelledError,
     BiliRewardError,
     BiliRewardTimeoutError,
@@ -88,9 +89,11 @@ class BiliRewardClient:
         limiter: RequestLimiter | TaskRequestLimiter | None = None,
         wall_time: Callable[[], float] | None = None,
         request_interval: float = 0,
+        ignore_risk_control: bool = False,
     ) -> None:
         self.timeout = timeout
         self.request_interval = request_interval
+        self.ignore_risk_control = ignore_risk_control
         self._wall_time = wall_time or time.time
         self.cookie_string = cookie_string
         pairs = (part.split("=", 1) for part in cookie_string.split(";") if "=" in part)
@@ -145,6 +148,34 @@ class BiliRewardClient:
             check()
 
     def _request_json(
+        self,
+        url: str,
+        data: Optional[bytes] = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> dict:
+        # Claim retries belong to the existing attempt/duration budget. Setup
+        # requests have a separate bounded window and release capacity while waiting.
+        claim = url.split("?", 1)[0] == MISSION_RECEIVE_URL
+        deadline = time.monotonic() + MISSION_INFO_RETRY_SECONDS
+        while True:
+            try:
+                return self._request_json_once(url, data, headers)
+            except BiliRetryableResponseError as exc:
+                if claim or time.monotonic() >= deadline:
+                    raise
+                callback = getattr(self._local, "log_callback", None)
+                delay = max(self.request_interval, MISSION_INFO_RETRY_INTERVAL)
+                if callback is not None:
+                    callback(f"[准备-重试] {exc}；等待 {delay * 1000:.0f} ms 后重试")
+                until = min(deadline, time.monotonic() + delay)
+                while time.monotonic() < until:
+                    self._check_request()
+                    self.limiter.check_blocked()
+                    time.sleep(min(0.05, max(0.0, until - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    raise
+
+    def _request_json_once(
         self,
         url: str,
         data: Optional[bytes] = None,
@@ -212,6 +243,10 @@ class BiliRewardClient:
             ) as response:
                 self._local.http_status = response.status_code
                 if response.status_code in (412, 429):
+                    if self.ignore_risk_control:
+                        raise BiliRetryableResponseError(
+                            f"[风控-继续尝试] HTTP {response.status_code}，可能导致风控加剧"
+                        )
                     self.limiter.block()
                     raise BiliRateLimitError(
                         f"[限流] HTTP {response.status_code}，停止当前任务请求"
@@ -234,20 +269,31 @@ class BiliRewardClient:
         if isinstance(details, dict):
             message += " " + str(details.get("message") or "")
         normalized = message.upper().replace(" ", "")
-        if payload.get("code") in (-352, -412, -509, -702, -705) or any(
+        risk = payload.get("code") in (-352, -412, -509) or any(
             marker in normalized
-            for marker in (
-                "IP访问异常",
-                "IP异常",
+            for marker in ("IP访问异常", "IP异常")
+        )
+        frequent = payload.get("code") in (-702, -705) or any(
+            marker in normalized for marker in (
                 "请求过于频繁",
                 "请求频率过高",
                 "访问过于频繁",
                 "操作太频繁",
             )
-        ):
+        )
+        if risk:
+            if self.ignore_risk_control:
+                raise BiliRetryableResponseError(
+                    format_api_failure("风控-继续尝试", payload.get("code"), payload.get("message"))
+                    + "；可能导致风控加剧"
+                )
             self.limiter.block()
             raise BiliRateLimitError(
                 format_api_failure("限流", payload.get("code"), payload.get("message"))
+            )
+        if frequent:
+            raise BiliRetryableResponseError(
+                format_api_failure("频率限制-可重试", payload.get("code"), payload.get("message"))
             )
         return payload
 
@@ -390,7 +436,7 @@ class BiliRewardClient:
                     raise BiliCookieInvalidError(str(error))
                 if log_callback is not None:
                     log_callback(str(error))
-                if code != -702 or time.monotonic() >= deadline:
+                if code not in (-702, -705) or time.monotonic() >= deadline:
                     raise error
                 until = min(deadline, time.monotonic() + MISSION_INFO_RETRY_INTERVAL)
                 while time.monotonic() < until:
@@ -582,6 +628,9 @@ class BiliRewardClient:
                         if sold_out(code, message):
                             raise BiliRewardError(f"[库存] 停止该链接: {last_error}")
                         network_failures = 0
+                    except BiliRetryableResponseError as exc:
+                        network_failures = 0
+                        last_error = str(exc)
                     except BiliRequestError as exc:
                         network_failures += 1
                         delay = max(

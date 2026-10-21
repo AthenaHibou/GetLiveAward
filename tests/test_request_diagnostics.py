@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from core.client import BiliRewardClient
 from core.constants import MISSION_RECEIVE_URL, MISSION_INFO_URL
-from core.errors import BiliRateLimitError, BiliRequestError
+from core.errors import BiliRateLimitError, BiliRequestError, BiliRetryableResponseError
 from core.logging_utils import format_log_line
 from core.models import AwardInfo, LinkTaskItem, RunSettings
 from core.network import RequestLimiter, RequestWait
@@ -55,7 +55,7 @@ class RequestDiagnosticTests(unittest.TestCase):
         for secret in ("COOKIE_SECRET", "REWARD_SECRET", "SIGNATURE_SECRET", "BODY_SECRET"):
             self.assertNotIn(secret, "\n".join(logs))
 
-    def test_rate_limit_response_is_logged_before_stopping_the_batch(self):
+    def test_frequency_response_is_logged_without_blocking_requests(self):
         logs = []
         response = Mock(status_code=200)
         response.__enter__ = Mock(return_value=response)
@@ -64,13 +64,13 @@ class RequestDiagnosticTests(unittest.TestCase):
         session = Mock()
         session.request.return_value = response
         with (patch.object(self.client, "_session", return_value=session),
-              patch.object(self.client, "get_web_sign", return_value="w_rid=SECRET")):
-            with self.assertRaises(BiliRateLimitError):
+              patch.object(self.client, "get_web_sign", return_value="w_rid=SECRET"),
+              patch("core.client.MISSION_INFO_RETRY_SECONDS", 0)):
+            with self.assertRaises(BiliRetryableResponseError):
                 self.client.get_award_info("task", log_callback=logs.append)
         self.assertIn("接口=任务信息", logs[0])
-        self.assertTrue(any("HTTP=200, code=-705" in line and "BiliRateLimitError" in line for line in logs))
-        with self.assertRaises(BiliRateLimitError):
-            self.client.limiter.check_blocked()
+        self.assertTrue(any("HTTP=200, code=-705" in line and "BiliRetryableResponseError" in line for line in logs))
+        self.client.limiter.check_blocked()
         self.assertIsNone(self.client._local.log_callback)
 
     def test_queue_rejection_is_not_reported_as_a_sent_request(self):

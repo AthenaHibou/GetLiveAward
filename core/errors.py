@@ -13,6 +13,10 @@ class BiliRequestError(BiliRewardError):
     """A transient transport failure that may be retried."""
 
 
+class BiliRetryableResponseError(BiliRequestError):
+    """A frequency response or explicitly permitted risk response to retry."""
+
+
 class BiliRateLimitError(BiliRewardError):
     """Stop the current task on rate limiting or risk control."""
 

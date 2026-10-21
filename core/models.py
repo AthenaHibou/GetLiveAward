@@ -32,6 +32,7 @@ class ClaimOptions:
     async_dispatch: bool = False
     execution_key: object | None = field(default=None, repr=False, compare=False)
     priority: int = 0
+    ignore_risk_control: bool = False
 
     def __post_init__(self) -> None:
         if not 1 <= self.thread_count <= 4:
@@ -75,6 +76,7 @@ class RunSettings:
     start_delay_ms: int = 20
     scheduled_retry_mode: str = "count"
     async_dispatch: bool = False
+    ignore_risk_control: bool = False
 
     def __post_init__(self) -> None:
         if not all(1 <= value <= 4 for value in (
@@ -159,6 +161,7 @@ class RunSettings:
             else None,
             self.jitter_ms if self.jitter_enabled else 0,
             self.async_dispatch,
+            ignore_risk_control=self.ignore_risk_control,
         )
 
 

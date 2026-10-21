@@ -84,11 +84,13 @@ class RewardService:
         qr_callback=None,
         cancel_check=None,
         timeout: float = 10.0,
+        ignore_risk_control: bool = False,
     ) -> None:
         """Authenticate without querying a task or submitting a reward claim."""
         logger = self.create_logger(log_callback)
         self._client(
-            ClaimOptions(task_id="", timeout=timeout), logger, qr_callback, cancel_check
+            ClaimOptions(task_id="", timeout=timeout, ignore_risk_control=ignore_risk_control),
+            logger, qr_callback, cancel_check
         )
         logger.log("[Cookie] 登录状态验证通过，可以等待奖励开放后开始领取")
 
@@ -148,6 +150,7 @@ class RewardService:
             ),
             wall_time=self.clock.now,
             request_interval=options.retry_interval,
+            ignore_risk_control=options.ignore_risk_control,
         )
         self._all_clients.append(client)
         return client
@@ -206,7 +209,8 @@ class RewardService:
             f"[运行参数] 领取线程={options.thread_count}, 全局在途上限={self._limiter.max_inflight}, "
             f"任务间隔={options.retry_interval * 1000:g} ms, 全局最小间隔={self._limiter.interval * 1000:g} ms, "
             f"每线程最多尝试={options.max_retry}, 时长限制={options.duration_seconds}秒, "
-            f"派发模式={'异步派发' if options.async_dispatch else '响应后等待'}"
+            f"派发模式={'异步派发' if options.async_dispatch else '响应后等待'}, "
+            f"无视风控继续尝试={options.ignore_risk_control}"
         )
         client, award_info = self._get_client_and_award_info(
             options,
