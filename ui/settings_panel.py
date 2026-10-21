@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from html import escape
 
 from PyQt5.QtCore import QSettings, Qt, QTime, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -33,7 +34,7 @@ class SettingsPanel(QWidget):
         super().__init__(parent)
         self.preferences = preferences
         self._applying = False
-        self.setFixedWidth(round(270 * theme.SCALE))
+        self.setFixedWidth(round(300 * theme.SCALE))
         self.title = title = QLabel("当前任务设置")
         title.setProperty("cssClass", "sectionTitle")
         scroll = QScrollArea()
@@ -47,10 +48,13 @@ class SettingsPanel(QWidget):
         self.interval_ms = QSpinBox()
         self.interval_ms.setRange(100, 60000)
         self.interval_ms.setSingleStep(100)
+        self.interval_label = QLabel("执行间隔 / ms")
+        form.addRow(self.interval_label, self.interval_ms)
         self.interval_ms.setToolTip(
-            "本任务的请求间隔与失败重试等待；实际还受账号全局最小间隔约束。1000 ms = 1 秒。"
+            "普通模式：收到上次响应后，再等待执行间隔。\n\n"
+            "异步派发：按两次发起时间计算执行间隔，无需等待上次响应。\n\n"
+            "所有请求仍受全局执行间隔和在途上限约束。1000 ms = 1 秒。"
         )
-        form.addRow("间隔 / ms", self.interval_ms)
         self.mode = SoftComboBox()
         self.mode.addItem("按尝试次数", "count")
         self.mode.addItem("按执行时长", "duration")
@@ -87,7 +91,7 @@ class SettingsPanel(QWidget):
         self.max_retry = QSpinBox()
         self.max_retry.setRange(1, 100000)
         self.max_retry.setToolTip(
-            "包含第一次提交。开启并发后，每个领取线程分别计算次数。"
+            "包含第一次提交。只有开启单任务请求并发时，才按每个领取线程分别计算次数。"
         )
         self.count_label = QLabel("尝试次数")
         form.addRow(self.count_label, self.max_retry)
@@ -129,14 +133,14 @@ class SettingsPanel(QWidget):
         global_title = QLabel("账号全局设置")
         global_title.setProperty("cssClass", "sectionTitle")
         form.addRow(global_title)
-        global_note = QLabel("所有任务共用；实际间隔取任务与全局设置中较大值。")
+        global_note = QLabel("所有任务共用账号最小请求间隔；任务自身间隔独立计算。")
         global_note.setWordWrap(True)
         global_note.setStyleSheet(f"color: {theme.TEXT_SUB};")
         form.addRow(global_note)
         self.global_interval_ms = QSpinBox()
         self.global_interval_ms.setRange(100, 60000)
         self.global_interval_ms.setSingleStep(100)
-        form.addRow("最小间隔 / ms", self.global_interval_ms)
+        form.addRow("最小执行间隔 / ms", self.global_interval_ms)
         form.addRow(self.sync)
         self.sync_group = QWidget()
         sync_form = QFormLayout(self.sync_group)
@@ -155,25 +159,80 @@ class SettingsPanel(QWidget):
         self.sync_status.setStyleSheet(f"color: {theme.TEXT_SUB};")
         sync_form.addRow(self.sync_status)
         form.addRow(self.sync_group)
-        self.concurrent = QCheckBox("启用请求并发（实验）")
-        form.addRow(self.concurrent)
-        self.requests = QSpinBox()
-        self.requests.setRange(1, 4)
-        form.addRow("并发请求上限", self.requests)
-        self.parallel_links = QCheckBox("同时处理多条链接")
-        form.addRow(self.parallel_links)
+        concurrency_title = QLabel("并发设置 · 高风险")
+        concurrency_title.setProperty("cssClass", "sectionTitle")
+        form.addRow(concurrency_title)
+        self.concurrency_group = QWidget()
+        concurrency_form = QFormLayout(self.concurrency_group)
+        concurrency_form.setContentsMargins(0, 0, 0, 0)
+        concurrency_form.setSpacing(round(8 * theme.SCALE))
+        self.risk_note = QLabel(
+            "高风险：并发可能触发限流、IP 异常或账号风控。\n"
+            "如果你不清楚会有什么后果，请勿变动此项。"
+        )
+        self.risk_note.setWordWrap(True)
+        self.risk_note.setStyleSheet(
+            f"color: {theme.RED}; background: #FFF0ED; padding: 8px; border-radius: 6px;"
+        )
+        concurrency_form.addRow(self.risk_note)
+        self.parallel_links = QCheckBox("多任务异步派发（不等待响应）")
+        self.parallel_links.setToolTip(
+            "默认关闭：前一个任务的请求返回后，再按列表优先级派发就绪请求。\n\n"
+            "开启：无需等待其他任务的请求返回，按全局执行间隔继续派发。"
+            "不会增加单任务的领取线程。\n\n"
+            "等待定时、重试或暂停不占执行机会。达到全局在途上限时仍需等待。"
+        )
+        concurrency_form.addRow(self.parallel_links)
         self.links = QSpinBox()
         self.links.setRange(1, 4)
-        form.addRow("同时链接数", self.links)
+        concurrency_form.addRow("同时在途任务数", self.links)
+        self.concurrent = QCheckBox("启用单任务请求并发")
+        self.concurrent.setToolTip("只增加每条任务的领取线程，与多任务并发分别控制。")
+        concurrency_form.addRow(self.concurrent)
+        self.requests = QSpinBox()
+        self.requests.setRange(1, 4)
+        concurrency_form.addRow("每任务请求上限", self.requests)
+        self.global_requests = QSpinBox()
+        self.global_requests.setRange(1, 4)
+        self.global_requests.setToolTip(
+            "所有任务合计的在途请求上限；只限制总量，不会自动增加单任务线程。"
+        )
+        concurrency_form.addRow("全局在途请求上限", self.global_requests)
+        self.async_dispatch = QCheckBox("异步派发")
+        self.async_dispatch.setToolTip(
+            "作用于每条任务内部，多任务时也分别生效。\n\n"
+            "开启后，按执行间隔发起下一次请求，无需等待上一次请求返回。\n\n"
+            "仍受每任务和全局在途请求上限约束；达到上限时等待空位。"
+            "上限为 1 时仍需等待响应。不积压或集中补发错过的请求。"
+        )
+        concurrency_form.addRow(self.async_dispatch)
+        self.dispatch_note = QLabel(
+            "多任务异步默认关闭：等前一个请求返回后，按列表顺序优先派发就绪请求。\n"
+            "等待定时、重试或暂停不占执行机会。\n\n"
+            "多任务异步：不等待其他任务的响应。\n"
+            "异步派发：每条任务内部不等待上次响应。\n\n"
+            "所有请求仍受执行间隔及在途上限约束；达到上限时等待。"
+        )
+        self.dispatch_note.setWordWrap(True)
+        self.dispatch_note.setStyleSheet(f"color: {theme.TEXT_SUB};")
+        concurrency_form.addRow(self.dispatch_note)
         self.warning = QLabel()
         self.warning.setWordWrap(True)
-        form.addRow(self.warning)
-        note = QLabel(
-            "无资格继续尝试；前一条结束或取消后才处理下一条。\n\nIP 异常 / 风控停止本批次，此保护始终开启。"
-        )
+        concurrency_form.addRow(self.warning)
+        form.addRow(self.concurrency_group)
+        note = QLabel("单条失败或限流只停止自身，其他任务继续；成功后停止重复领取。")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {theme.TEXT_SUB};")
         form.addRow(note)
+        # Rich-text tooltips wrap within a predictable width on Windows, unlike
+        # plain tooltips which can span the entire desktop as one long line.
+        tooltip_width = round(300 * theme.SCALE)
+        for widget in content.findChildren(QWidget):
+            if widget.toolTip():
+                body = escape(widget.toolTip()).replace("\n", "<br>")
+                widget.setToolTip(
+                    f'<qt><table width="{tooltip_width}"><tr><td>{body}</td></tr></table></qt>'
+                )
         scroll.setWidget(content)
         reset = QPushButton("恢复默认设置")
         reset.setCursor(Qt.PointingHandCursor)
@@ -187,6 +246,7 @@ class SettingsPanel(QWidget):
         for control in (
             self.mode,
             self.concurrent,
+            self.async_dispatch,
             self.parallel_links,
             self.interval_ms,
             self.after_schedule,
@@ -205,7 +265,7 @@ class SettingsPanel(QWidget):
         for control in (self.interval_ms, self.mode, self.after_schedule, self.schedule_time,
                         self.start_delay, self.max_retry, self.duration, self.timeout_ms,
                         self.sold_out, self.jitter, self.jitter_ms, self.sync, self.server,
-                        self.sync_interval, self.concurrent, self.requests, self.parallel_links,
+                        self.sync_interval, self.concurrent, self.async_dispatch, self.requests, self.global_requests, self.parallel_links,
                         self.links, self.global_interval_ms):
             signal = (control.currentIndexChanged if isinstance(control, QComboBox)
                       else control.toggled if isinstance(control, QCheckBox)
@@ -222,7 +282,9 @@ class SettingsPanel(QWidget):
         return RunSettings(
             global_interval_ms=self.global_interval_ms.value(),
             concurrent=self.concurrent.isChecked(),
+            async_dispatch=self.async_dispatch.isChecked(),
             request_workers=self.requests.value(),
+            global_request_workers=self.global_requests.value(),
             parallel_links=self.parallel_links.isChecked(),
             link_workers=self.links.value(),
             interval_ms=self.interval_ms.value(),
@@ -283,7 +345,9 @@ class SettingsPanel(QWidget):
             self.after_schedule.findData(settings.scheduled_retry_mode)
         )
         self.concurrent.setChecked(settings.concurrent)
+        self.async_dispatch.setChecked(settings.async_dispatch)
         self.requests.setValue(settings.request_workers)
+        self.global_requests.setValue(settings.global_request_workers)
         self.parallel_links.setChecked(settings.parallel_links)
         self.links.setValue(settings.link_workers)
         self._update_controls()
@@ -324,16 +388,14 @@ class SettingsPanel(QWidget):
         self.duration.setVisible(mode == "duration")
         self.duration_label.setVisible(mode == "duration")
         self.duration_note.setVisible(mode == "duration")
-        enabled = self.concurrent.isChecked()
-        self.requests.setEnabled(enabled)
-        self.parallel_links.setEnabled(enabled)
-        self.links.setEnabled(enabled and self.parallel_links.isChecked())
+        self.requests.setEnabled(self.concurrent.isChecked() or self.async_dispatch.isChecked())
+        self.links.setEnabled(self.parallel_links.isChecked())
+        enabled = self.concurrent.isChecked() or self.parallel_links.isChecked() or self.async_dispatch.isChecked()
+        self.global_requests.setEnabled(enabled)
         risky = enabled or self.interval_ms.value() < 1000
         self.warning.setText(
-            "并发或较短间隔可能触发 IP 异常；没有通用的安全频率保证。"
-            if risky
-            else "默认：串行请求、逐条链接。"
+            "已启用并发或异步；每任务、任务间和全局在途上限仍然有效。"
+            if enabled
+            else "当前不允许请求重叠；任务各自等待，按列表优先派发。"
         )
-        self.warning.setStyleSheet(
-            f"color: {theme.AMBER if risky else theme.TEXT_SUB};"
-        )
+        self.warning.setStyleSheet(f"color: {theme.AMBER if risky else theme.TEXT_SUB};")

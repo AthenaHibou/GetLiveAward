@@ -298,3 +298,38 @@ class AsyncDispatchTests(unittest.TestCase):
         self.assertEqual(settings.active_requests, 2)
         self.assertEqual(settings.claim_options("task").thread_count, 3)
         self.assertTrue(settings.claim_options("task").async_dispatch)
+
+
+class AsyncSettingsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_checkbox_works_independently_and_persists_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            window = MainWindow(RewardService(root))
+            try:
+                self.assertFalse(window.settings_panel.async_dispatch.isChecked())
+                window.settings_panel.async_dispatch.setChecked(True)
+                self.assertFalse(window.settings_panel.concurrent.isChecked())
+                self.assertTrue(window.settings_panel.requests.isEnabled())
+                window.settings_panel.parallel_links.setChecked(True)
+                window.settings_panel.global_requests.setValue(3)
+                self.assertEqual(window.settings_panel.snapshot().active_requests, 3)
+                self.assertEqual(window.settings_panel.snapshot().claim_options("task").thread_count, 2)
+                self.assertTrue(window._autosave_workspace())
+                saved = load_document(window._workspace_path())
+                self.assertTrue(saved.global_settings.async_dispatch)
+                self.assertNotIn("async_dispatch", saved.payload()["tasks"][0]["settings"])
+            finally:
+                window.close()
+            reopened = MainWindow(RewardService(root))
+            try:
+                self.assertTrue(reopened.settings_panel.async_dispatch.isChecked())
+                self.assertTrue(reopened.settings_panel.parallel_links.isChecked())
+                self.assertFalse(reopened.settings_panel.concurrent.isChecked())
+                self.assertEqual(reopened.settings_panel.global_requests.value(), 3)
+                reopened.settings_panel.apply(RunSettings())
+                self.assertFalse(reopened.settings_panel.async_dispatch.isChecked())
+            finally:
+                reopened.close()

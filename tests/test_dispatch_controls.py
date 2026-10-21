@@ -132,3 +132,114 @@ class DispatchControlTests(unittest.TestCase):
                     self.assertTrue(ready.wait(1))
                     self.assertFalse(future.done())
                 self.assertTrue(future.result(1))
+
+
+class DispatchUiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        self.window = MainWindow(RewardService(self.root.name))
+        self.addCleanup(self.window.close)
+
+    def test_controls_persist_independently_and_explain_defaults(self):
+        panel = self.window.settings_panel
+        self.assertFalse(panel.parallel_links.isChecked())
+        self.assertFalse(panel.concurrent.isChecked())
+        self.assertFalse(panel.requests.isEnabled())
+        panel.parallel_links.setChecked(True)
+        self.assertTrue(panel.links.isEnabled())
+        self.assertFalse(panel.requests.isEnabled())
+        panel.global_requests.setValue(3)
+        panel.async_dispatch.setChecked(True)
+        self.assertEqual(panel.snapshot().claim_options("a").thread_count, 2)
+        self.assertIn("默认关闭", panel.dispatch_note.text())
+        self.assertIn("列表顺序", panel.dispatch_note.text())
+        self.assertIn("多任务", panel.async_dispatch.toolTip())
+        self.assertIn("请勿变动", panel.risk_note.text())
+        self.assertEqual(panel.interval_label.text(), "执行间隔 / ms")
+        self.assertEqual(panel.async_dispatch.text(), "异步派发")
+        self.assertIn("多任务异步派发", panel.parallel_links.text())
+        self.assertIn("<table width=", panel.async_dispatch.toolTip())
+        self.assertIn("<br><br>", panel.async_dispatch.toolTip())
+        self.assertTrue(self.window._autosave_workspace())
+        self.window.close()
+        reopened = MainWindow(RewardService(self.root.name))
+        self.addCleanup(reopened.close)
+        saved = reopened.settings_panel.snapshot()
+        self.assertTrue(saved.parallel_links)
+        self.assertFalse(saved.concurrent)
+        self.assertTrue(saved.async_dispatch)
+        self.assertEqual(saved.global_request_workers, 3)
+
+    def test_single_task_async_sends_next_http_before_response_without_concurrent_toggle(self):
+        service = self.window.service
+        settings = RunSettings(async_dispatch=True, request_workers=2, global_request_workers=2,
+                               interval_ms=100, global_interval_ms=100, max_retry=1)
+        self.assertFalse(settings.concurrent)
+        self.assertFalse(settings.parallel_links)
+        service.configure(settings)
+        save_cookie_file(service.paths.cookie_file, {"SESSDATA": "fake", "bili_jct": "fake"})
+        second_started = threading.Event()
+        calls, checks = [], []
+        lock = threading.Lock()
+        def respond(client, url, data, headers):
+            with lock:
+                calls.append(data)
+                first = len(calls) == 1
+            if first:
+                checks.append(second_started.wait(2))
+            else:
+                second_started.set()
+            return {"code": 0, "data": {}}
+        with (patch.object(BiliRewardClient, "ensure_logged_in", return_value={}),
+              patch.object(BiliRewardClient, "get_award_info", return_value=AwardInfo("a", "a", "t", "r")),
+              patch.object(BiliRewardClient, "get_web_sign", return_value="test=1"),
+              patch.object(BiliRewardClient, "_perform_request", respond)):
+            service.run_claim(settings.claim_options("a"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(checks, [True])
+
+
+    def test_multi_task_async_http_can_overlap_without_extra_task_workers(self):
+        service = self.window.service
+        save_cookie_file(service.paths.cookie_file, {"SESSDATA": "fake", "bili_jct": "fake"})
+        worker = ClaimWorker(service, [LinkTaskItem(i, "", str(i)) for i in range(2)],
+            RunSettings(parallel_links=True, global_request_workers=2,
+                        global_interval_ms=100, interval_ms=100, max_retry=1))
+        first, second = threading.Event(), threading.Event()
+        active, maximum = {}, {}
+        results, checks = [], []
+        lock = threading.Lock()
+        worker.batch_completed.connect(results.append)
+
+        def respond(client, url, data, headers):
+            if "nav" in url:
+                return {"code": 0, "data": {"isLogin": True, "wbi_img": {
+                    "img_url": "https://x/" + "a" * 32 + ".png",
+                    "sub_url": "https://x/" + "b" * 32 + ".png"}}}
+            if data is None:
+                return {"code": 0, "data": {"act_id": "a", "act_name": "a", "task_name": "t",
+                                             "reward_info": {"award_name": "award"}}}
+            with lock:
+                active[client] = active.get(client, 0) + 1
+                maximum[client] = max(maximum.get(client, 0), active[client])
+                is_first = not first.is_set()
+                if is_first:
+                    first.set()
+                else:
+                    second.set()
+            if is_first:
+                checks.append(second.wait(2))
+            with lock:
+                active[client] -= 1
+            return {"code": 0, "data": {}}
+
+        with patch.object(BiliRewardClient, "_perform_request", respond):
+            worker.run()
+        self.assertEqual(checks, [True])
+        self.assertEqual(list(maximum.values()), [1, 1])
+        self.assertEqual([r.status for r in results[0].results], ["success", "success"])

@@ -146,7 +146,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         self.login_btn.setToolTip("验证当前账号的登录状态；未登录或已失效时会弹出二维码，不会提交领取")
         self.login_btn.clicked.connect(self.start_login)
         self.start_btn = _btn("全部开始", "batchStart", root)
-        self.start_btn.setToolTip("运行所有已勾选任务；默认按顺序串行")
+        self.start_btn.setToolTip("独立运行所有已勾选任务；单条失败不影响其他任务，共用全局请求限制")
         self.start_btn.clicked.connect(lambda: self.start_claim())
         self.stop_all_btn = _btn("全部停止", "cancelBtn", root)
         self.stop_all_btn.setEnabled(False)
