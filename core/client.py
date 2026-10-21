@@ -166,7 +166,8 @@ class BiliRewardClient:
                 callback = getattr(self._local, "log_callback", None)
                 delay = max(self.request_interval, MISSION_INFO_RETRY_INTERVAL)
                 if callback is not None:
-                    callback(f"[准备-重试] {exc}；等待 {delay * 1000:.0f} ms 后重试")
+                    callback(str(exc))
+                    callback(f"[重试-等待] 阶段=任务准备, 响应处理后等待={delay * 1000:.3f} ms；原因={exc}")
                 until = min(deadline, time.monotonic() + delay)
                 while time.monotonic() < until:
                     self._check_request()
@@ -219,7 +220,7 @@ class BiliRewardClient:
                     claim_stop.set()
                 return payload
         except Exception as exc:
-            outcome = type(exc).__name__
+            outcome = "可重试失败" if isinstance(exc, BiliRequestError) else type(exc).__name__
             raise
         finally:
             finished = time.perf_counter()
@@ -231,6 +232,15 @@ class BiliRewardClient:
                         f"[请求-响应] {label}, HTTP={self._local.http_status}, code={self._local.api_code}, "
                         f"HTTP调用耗时={(finished - started) * 1000:.3f} ms, 结果={outcome}"
                     )
+
+    def _response_failure(self, url, code, message) -> str:
+        stage = {
+            MISSION_RECEIVE_URL: "领取-提交",
+            MISSION_INFO_URL: "领取-任务信息",
+            NAV_URL: "登录验证",
+        }.get(url.split("?", 1)[0], "接口响应")
+        return format_api_failure(stage, code, message,
+                                  detail=getattr(self._local, "claim_context", ""))
 
     def _perform_request(self, url, data, headers) -> dict:
         try:
@@ -245,7 +255,8 @@ class BiliRewardClient:
                 if response.status_code in (412, 429):
                     if self.ignore_risk_control:
                         raise BiliRetryableResponseError(
-                            f"[风控-继续尝试] HTTP {response.status_code}，可能导致风控加剧"
+                            self._response_failure(url, f"HTTP {response.status_code}",
+                                "已启用无视风控继续尝试，可能导致风控加剧")
                         )
                     self.limiter.block()
                     raise BiliRateLimitError(
@@ -284,8 +295,8 @@ class BiliRewardClient:
         if risk:
             if self.ignore_risk_control:
                 raise BiliRetryableResponseError(
-                    format_api_failure("风控-继续尝试", payload.get("code"), payload.get("message"))
-                    + "；可能导致风控加剧"
+                    self._response_failure(url, payload.get("code"),
+                        f"{payload.get('message')}；已启用无视风控继续尝试，可能导致风控加剧")
                 )
             self.limiter.block()
             raise BiliRateLimitError(
@@ -293,7 +304,7 @@ class BiliRewardClient:
             )
         if frequent:
             raise BiliRetryableResponseError(
-                format_api_failure("频率限制-可重试", payload.get("code"), payload.get("message"))
+                self._response_failure(url, payload.get("code"), payload.get("message"))
             )
         return payload
 
@@ -636,7 +647,8 @@ class BiliRewardClient:
                         delay = max(
                             retry_interval, min(8.0, 2 ** min(network_failures - 1, 3))
                         ) + random.uniform(0, 0.2)
-                        last_error = str(exc)
+                        last_error = format_api_failure("领取-提交", "网络异常", str(exc),
+                                                       detail=f"worker={worker_id}, attempt={attempt}")
                     if log_callback is not None:
                         log_callback(last_error)
                     if budget.has_remaining(worker_id):
@@ -648,7 +660,7 @@ class BiliRewardClient:
                             delay += random.uniform(0, jitter_ms / 1000)
                         if log_callback is not None:
                             log_callback(f"[重试-等待] worker={worker_id}, 下一次attempt={attempt + 1}, "
-                                         f"响应处理后等待={delay * 1000:.3f} ms；随后仍受全局限流约束")
+                                         f"响应处理后等待={delay * 1000:.3f} ms；随后仍受全局限流约束；原因={last_error}")
                         until = time.monotonic() + delay
                         while time.monotonic() < until:
                             check()

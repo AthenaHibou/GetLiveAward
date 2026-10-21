@@ -69,7 +69,7 @@ class RequestDiagnosticTests(unittest.TestCase):
             with self.assertRaises(BiliRetryableResponseError):
                 self.client.get_award_info("task", log_callback=logs.append)
         self.assertIn("接口=任务信息", logs[0])
-        self.assertTrue(any("HTTP=200, code=-705" in line and "BiliRetryableResponseError" in line for line in logs))
+        self.assertTrue(any("HTTP=200, code=-705" in line and "可重试失败" in line for line in logs))
         self.client.limiter.check_blocked()
         self.assertIsNone(self.client._local.log_callback)
 
@@ -93,7 +93,7 @@ class RequestDiagnosticTests(unittest.TestCase):
         with patch.object(self.client, "_session", return_value=session):
             with self.assertRaises(BiliRequestError):
                 self.client._request_json(MISSION_INFO_URL)
-        self.assertTrue(any("HTTP调用耗时=" in line and "BiliRequestError" in line for line in logs))
+        self.assertTrue(any("HTTP调用耗时=" in line and "可重试失败" in line for line in logs))
         self.assertNotIn("URL_OR_TOKEN_SECRET", "\n".join(logs))
 
     def test_log_timestamp_includes_milliseconds(self):

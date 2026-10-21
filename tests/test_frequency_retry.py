@@ -38,12 +38,18 @@ class FrequencyRetryTests(unittest.TestCase):
                             {"code": 999, "message": "请求频率过高，请稍后再试"}):
                 with self.subTest(async_dispatch=asynchronous, payload=payload):
                     client = self.client()
+                    logs = []
                     client._session().request.side_effect = [response(payload), response(SUCCESS)]
                     _, key = client.claim_award("task", award_info=AWARD, max_retry=2,
-                                                retry_interval=0, async_dispatch=asynchronous)
+                                                retry_interval=0, async_dispatch=asynchronous,
+                                                log_callback=logs.append)
                     self.assertEqual(key, "TEST-KEY")
                     self.assertEqual(client._session().request.call_count, 2)
                     client.limiter.check_blocked()
+                    self.assertTrue(any(line.startswith("[领取-提交] 失败:") for line in logs))
+                    self.assertFalse(any("频率限制-可重试" in line or "BiliRetryableResponseError" in line for line in logs))
+                    if not asynchronous:
+                        self.assertTrue(any("[重试-等待]" in line and "原因=[领取-提交] 失败:" in line for line in logs))
 
     def test_explicit_risk_defaults_to_stop_and_opt_in_retries(self):
         cases = [(412, {}), (429, {}),
