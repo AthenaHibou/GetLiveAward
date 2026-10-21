@@ -5,14 +5,14 @@ import logging
 import threading
 import weakref
 from logging.handlers import RotatingFileHandler
-from time import strftime
+from datetime import datetime
 from typing import Protocol
 
 from .models import OptionalLogCallback
 
 
 def format_log_line(message: str) -> str:
-    timestamp = strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     return f"[{timestamp}] {message}"
 
 

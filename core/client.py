@@ -5,6 +5,7 @@ import random
 import threading
 import time
 import urllib.parse
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Callable
 
@@ -36,7 +37,7 @@ from .models import (
     OptionalCancelCheck,
     OptionalLogCallback,
 )
-from .network import RequestLimiter
+from .network import RequestLimiter, TaskRequestLimiter
 
 
 def format_api_failure(
@@ -84,7 +85,7 @@ class BiliRewardClient:
         cookie_string: str,
         timeout: float = 10.0,
         *,
-        limiter: RequestLimiter | None = None,
+        limiter: RequestLimiter | TaskRequestLimiter | None = None,
         wall_time: Callable[[], float] | None = None,
         request_interval: float = 0,
     ) -> None:
@@ -149,8 +150,46 @@ class BiliRewardClient:
         data: Optional[bytes] = None,
         headers: Optional[dict[str, str]] = None,
     ) -> dict:
-        with self.limiter.request_slot(self._check_request, self.request_interval):
-            return self._perform_request(url, data, headers)
+        callback = getattr(self._local, "log_callback", None)
+        endpoint = {
+            NAV_URL: "登录验证/签名密钥",
+            MISSION_INFO_URL: "任务信息",
+            MISSION_RECEIVE_URL: "领取提交",
+        }.get(url.split("?", 1)[0], "其他接口")
+        # Only log a fixed endpoint label: signed URLs, bodies, cookies and
+        # response contents can contain credentials or redemption codes.
+        context = getattr(self._local, "claim_context", "")
+        label = f"request={uuid.uuid4().hex[:12]}, 接口={endpoint}"
+        if context:
+            label += f", {context}"
+        queued, started, outcome = time.perf_counter(), None, "完成"
+        self._local.http_status = None
+        self._local.api_code = None
+        try:
+            with self.limiter.request_slot(self._check_request, self.request_interval) as wait:
+                if callback is not None:
+                    callback(
+                        f"[请求-发送] {label}, 方法={'POST' if data is not None else 'GET'}, "
+                        f"并发槽等待={wait.slot_seconds * 1000:.3f} ms, "
+                        f"间隔限流等待={wait.interval_seconds * 1000:.3f} ms"
+                    )
+                started = time.perf_counter()
+                payload = self._perform_request(url, data, headers)
+                self._local.api_code = payload.get("code")
+                return payload
+        except Exception as exc:
+            outcome = type(exc).__name__
+            raise
+        finally:
+            finished = time.perf_counter()
+            if callback is not None:
+                if started is None:
+                    callback(f"[请求-未发送] {label}, 排队耗时={(finished - queued) * 1000:.3f} ms, 结果={outcome}")
+                else:
+                    callback(
+                        f"[请求-响应] {label}, HTTP={self._local.http_status}, code={self._local.api_code}, "
+                        f"HTTP调用耗时={(finished - started) * 1000:.3f} ms, 结果={outcome}"
+                    )
 
     def _perform_request(self, url, data, headers) -> dict:
         try:
@@ -161,10 +200,11 @@ class BiliRewardClient:
                 headers=headers,
                 timeout=(min(5.0, self.timeout), self.timeout),
             ) as response:
+                self._local.http_status = response.status_code
                 if response.status_code in (412, 429):
                     self.limiter.block()
                     raise BiliRateLimitError(
-                        f"[限流] HTTP {response.status_code}，停止本批次请求"
+                        f"[限流] HTTP {response.status_code}，停止当前任务请求"
                     )
                 response.raise_for_status()
                 payload = response.json()
@@ -178,17 +218,19 @@ class BiliRewardClient:
             raise BiliRequestError(f"网络请求失败: {type(exc).__name__}") from exc
         if not isinstance(payload, dict):
             raise BiliRewardError("接口返回的 JSON 不是对象")
+        self._local.api_code = payload.get("code")
         message = str(payload.get("message") or "")
         details = payload.get("data")
         if isinstance(details, dict):
             message += " " + str(details.get("message") or "")
         normalized = message.upper().replace(" ", "")
-        if payload.get("code") in (-352, -412, -509) or any(
+        if payload.get("code") in (-352, -412, -509, -702, -705) or any(
             marker in normalized
             for marker in (
                 "IP访问异常",
                 "IP异常",
                 "请求过于频繁",
+                "请求频率过高",
                 "访问过于频繁",
                 "操作太频繁",
             )
@@ -229,8 +271,11 @@ class BiliRewardClient:
                 self._wbi_lock.release()
             self._local.fetching_keys = False
 
-    def ensure_logged_in(self, *, cancel_check: OptionalCancelCheck = None) -> dict:
+    def ensure_logged_in(self, *, cancel_check: OptionalCancelCheck = None,
+                         log_callback: OptionalLogCallback = None) -> dict:
         previous = getattr(self._local, "check", None)
+        previous_log = getattr(self._local, "log_callback", None)
+        self._local.log_callback = log_callback
         if cancel_check is not None:
             self._local.check = lambda: self._check_cancel(cancel_check)
         try:
@@ -246,6 +291,7 @@ class BiliRewardClient:
             return data
         finally:
             self._local.check = previous
+            self._local.log_callback = previous_log
 
     def get_web_sign(self, params: Optional[dict[str, str]] = None) -> str:
         raw_params = dict(params or {})
@@ -299,6 +345,8 @@ class BiliRewardClient:
         cancel_check: OptionalCancelCheck = None,
     ) -> AwardInfo:
         deadline = time.monotonic() + MISSION_INFO_RETRY_SECONDS
+        previous_log = getattr(self._local, "log_callback", None)
+        self._local.log_callback = log_callback
         self._local.check = lambda: self._check_cancel(cancel_check)
         try:
             while True:
@@ -342,6 +390,7 @@ class BiliRewardClient:
                     raise error
         finally:
             self._local.check = None
+            self._local.log_callback = previous_log
 
     def claim_award(
         self,
@@ -358,6 +407,7 @@ class BiliRewardClient:
         jitter_ms: int = 0,
         retry_budget: ClaimRetryBudget | None = None,
         cancel_check: OptionalCancelCheck = None,
+        async_dispatch: bool = False,
     ) -> tuple[AwardInfo, str | None]:
         ClaimOptions(
             task_id,
@@ -368,6 +418,7 @@ class BiliRewardClient:
             stop_sold_out,
             duration_seconds,
             jitter_ms,
+            async_dispatch,
         )
         control = claim_control or ClaimExecutionControl()
         budget = retry_budget or ClaimRetryBudget(max_retry, thread_count)
@@ -390,6 +441,7 @@ class BiliRewardClient:
             }
         ).encode("utf-8")
         stop = threading.Event()
+
         deadline = (
             None if duration_seconds is None else time.monotonic() + duration_seconds
         )
@@ -411,8 +463,41 @@ class BiliRewardClient:
                 raise _ClaimStopped("任务已结束")
             control.check_cancelled()
 
+        dispatch_lock = threading.Lock()
+        next_dispatch = [0.0]
+        last_dispatch = [None]
+
+        def wait_dispatch(worker_id: int, attempt: int) -> None:
+            # Only the bounded set of claim workers can wait here. Do not
+            # enqueue timer ticks while all workers are awaiting responses.
+            while not dispatch_lock.acquire(timeout=0.01):
+                check()
+            try:
+                while True:
+                    check()
+                    remaining = next_dispatch[0] - time.perf_counter()
+                    if remaining <= 0:
+                        now = time.perf_counter()
+                        previous = last_dispatch[0]
+                        last_dispatch[0] = now
+                        next_dispatch[0] = now + retry_interval
+                        if jitter_ms:
+                            next_dispatch[0] += random.uniform(0, jitter_ms / 1000)
+                        if log_callback is not None:
+                            gap = "首发" if previous is None else f"{(now - previous) * 1000:.3f} ms"
+                            log_callback(f"[异步-派发] worker={worker_id}, attempt={attempt}, "
+                                         f"派发间隔={gap}；HTTP调用仍受全局限流约束")
+                        return
+                    if remaining > 0.02:
+                        stop.wait(min(0.02, remaining))
+                    else:
+                        time.sleep(min(0.001, remaining))
+            finally:
+                dispatch_lock.release()
+
         def worker(worker_id: int) -> str | None:
             self._local.check = check
+            self._local.log_callback = log_callback
             last_error = ""
             network_failures = 0
             try:
@@ -421,6 +506,9 @@ class BiliRewardClient:
                     attempt = budget.reserve(worker_id)
                     if attempt is None:
                         break
+                    self._local.claim_context = f"worker={worker_id}, attempt={attempt}"
+                    if async_dispatch:
+                        wait_dispatch(worker_id, attempt)
                     delay = retry_interval
                     try:
                         payload = self._signed_request(MISSION_RECEIVE_URL, data=body)
@@ -492,8 +580,15 @@ class BiliRewardClient:
                     if log_callback is not None:
                         log_callback(last_error)
                     if budget.has_remaining(worker_id):
+                        if async_dispatch and network_failures == 0:
+                            # Cadence is shared across workers and measured
+                            # from dispatch, not from response completion.
+                            continue
                         if jitter_ms:
                             delay += random.uniform(0, jitter_ms / 1000)
+                        if log_callback is not None:
+                            log_callback(f"[重试-等待] worker={worker_id}, 下一次attempt={attempt + 1}, "
+                                         f"响应处理后等待={delay * 1000:.3f} ms；随后仍受全局限流约束")
                         until = time.monotonic() + delay
                         while time.monotonic() < until:
                             check()
@@ -506,6 +601,8 @@ class BiliRewardClient:
                 raise
             finally:
                 self._local.check = None
+                self._local.log_callback = None
+                self._local.claim_context = ""
                 self._close_thread_session()
 
         if thread_count == 1:

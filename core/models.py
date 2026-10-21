@@ -4,7 +4,7 @@ import threading
 import math
 import time
 from typing import Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 from datetime import time as DayTime
 
@@ -29,6 +29,9 @@ class ClaimOptions:
     stop_sold_out: bool = True
     duration_seconds: float | None = None
     jitter_ms: int = 0
+    async_dispatch: bool = False
+    execution_key: object | None = field(default=None, repr=False, compare=False)
+    priority: int = 0
 
     def __post_init__(self) -> None:
         if not 1 <= self.thread_count <= 4:
@@ -54,6 +57,7 @@ class RunSettings:
     global_interval_ms: int = 1000
     concurrent: bool = False
     request_workers: int = 2
+    global_request_workers: int = 2
     parallel_links: bool = False
     link_workers: int = 2
     interval_ms: int = 1000
@@ -70,9 +74,12 @@ class RunSettings:
     scheduled_time: str = "00:00:00"
     start_delay_ms: int = 20
     scheduled_retry_mode: str = "count"
+    async_dispatch: bool = False
 
     def __post_init__(self) -> None:
-        if not 1 <= self.request_workers <= 4 or not 1 <= self.link_workers <= 4:
+        if not all(1 <= value <= 4 for value in (
+            self.request_workers, self.link_workers, self.global_request_workers
+        )):
             raise ValueError("并发数必须在 1 到 4 之间")
         if not 100 <= self.interval_ms <= 60000:
             raise ValueError("请求间隔必须在 100 到 60000 ms 之间")
@@ -113,11 +120,15 @@ class RunSettings:
 
     @property
     def active_requests(self) -> int:
-        return self.request_workers if self.concurrent else 1
+        return self.global_request_workers if self.concurrent or self.parallel_links or self.async_dispatch else 1
+
+    @property
+    def task_request_workers(self) -> int:
+        return self.request_workers if self.concurrent or self.async_dispatch else 1
 
     @property
     def active_links(self) -> int:
-        return self.link_workers if self.concurrent and self.parallel_links else 1
+        return self.link_workers if self.parallel_links else 1
 
     @property
     def interval(self) -> float:
@@ -138,7 +149,7 @@ class RunSettings:
     def claim_options(self, task_id: str) -> ClaimOptions:
         return ClaimOptions(
             task_id,
-            self.active_requests,
+            self.task_request_workers,
             self.max_retry if self.effective_retry_mode == "count" else None,
             self.interval,
             self.timeout,
@@ -147,6 +158,7 @@ class RunSettings:
             if self.effective_retry_mode == "duration"
             else None,
             self.jitter_ms if self.jitter_enabled else 0,
+            self.async_dispatch,
         )
 
 

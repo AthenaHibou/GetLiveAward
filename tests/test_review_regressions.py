@@ -150,13 +150,15 @@ class ReviewTests(unittest.TestCase):
                 self.service.claim_prepared_task(task)
         refresh.assert_not_called()
 
-    def test_risk_block_stops_another_tasks_scheduled_wait(self):
+    def test_task_risk_does_not_stop_another_tasks_scheduled_wait(self):
         worker = ClaimWorker(self.service, [LinkTaskItem(0, "", "a"), LinkTaskItem(1, "", "b")])
-        self.service._limiter.block()
+        client = self.service._new_client(ClaimOptions("a"))
+        client.limiter.block()
         self.service.clock = Mock(now=Mock(return_value=100), age=Mock(return_value=0))
-        with patch.object(worker._cancel_event, "wait", side_effect=RuntimeError("still waiting")):
-            with self.assertRaises(BiliRateLimitError):
+        with patch.object(worker._cancel_event, "wait", side_effect=lambda _: worker.cancel_all()) as wait:
+            with self.assertRaises(BiliRewardCancelledError):
                 worker._wait_scheduled(1000, {0: Mock()})
+        wait.assert_called_once()
 
     def test_real_local_http_risk_responses_block_following_requests(self):
         class Handler(BaseHTTPRequestHandler):
@@ -257,9 +259,9 @@ class ReviewTests(unittest.TestCase):
                 self.fail("Qt worker did not finish within 4 seconds")
         self.assertEqual([row.status_label.text() for row in window.link_rows], ["成功", "成功"])
         self.assertEqual(len(receives), 3)
-        self.assertIn(b"task_id=a", receives[0])
-        self.assertIn(b"task_id=a", receives[1])
-        self.assertIn(b"task_id=b", receives[2])
+        task_ids = [body.split(b"&", 1)[0] for body in receives]
+        self.assertEqual(set(task_ids), {b"task_id=a", b"task_id=b"})
+        self.assertEqual(sorted(task_ids.count(tid) for tid in set(task_ids)), [1, 2])
         self.assertFalse(window._is_running)
         self.assertTrue(window.start_btn.isEnabled())
         self.assertIn("测试用户", window.account_combo.currentText())

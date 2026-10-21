@@ -14,7 +14,7 @@ class BiliRequestError(BiliRewardError):
 
 
 class BiliRateLimitError(BiliRewardError):
-    """Stop the batch on rate limiting or risk control."""
+    """Stop the current task on rate limiting or risk control."""
 
 
 class BiliRewardTimeoutError(BiliRewardError):

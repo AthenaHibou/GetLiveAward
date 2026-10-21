@@ -508,8 +508,9 @@ class ServiceTests(unittest.TestCase):
             (options.thread_count, options.max_retry, options.retry_interval),
             (1, 60, 1.0),
         )
-        disabled = RunSettings(parallel_links=True, request_workers=4, link_workers=4)
-        self.assertEqual((disabled.active_links, disabled.active_requests), (1, 1))
+        multi_only = RunSettings(parallel_links=True, request_workers=4, link_workers=4)
+        self.assertEqual((multi_only.active_links, multi_only.active_requests), (4, 2))
+        self.assertEqual(multi_only.claim_options("task").thread_count, 1)
 
     def test_duration_settings_convert_minutes_and_ms(self):
         options = RunSettings(
@@ -1010,7 +1011,7 @@ class UiTests(unittest.TestCase):
             worker._wait_scheduled(1700000010, {})
         synchronize.assert_called_once()
 
-    def test_default_batch_is_serial_and_cancelled_queue_is_skipped(self):
+    def test_default_batch_uses_one_claim_worker_per_task_and_skips_cancelled_rows(self):
         tasks = [LinkTaskItem(i, "", str(i)) for i in range(3)]
         worker = ClaimWorker(self.service, tasks)
         worker.cancel_claim(1)
@@ -1025,7 +1026,7 @@ class UiTests(unittest.TestCase):
 
         with patch.object(self.service, "prepare_link_task", side_effect=prepare):
             worker.run()
-        self.assertEqual(calls, [0, 2])
+        self.assertCountEqual(calls, [0, 2])
         self.assertEqual(
             [r.status for r in batches[0].results], ["failed", "cancelled", "failed"]
         )
@@ -1132,8 +1133,9 @@ class UiTests(unittest.TestCase):
             self.assertEqual(window.link_rows[0].index_label.width(), 42)
             window.close()
 
-    def test_batch_concurrency_is_bounded(self):
+    def test_all_task_executions_can_wait_independently_of_legacy_link_limit(self):
         tasks = [LinkTaskItem(i, "", str(i)) for i in range(9)]
+        all_started = threading.Barrier(len(tasks))
         worker = ClaimWorker(
             self.service,
             tasks,
@@ -1149,7 +1151,7 @@ class UiTests(unittest.TestCase):
             with lock:
                 active += 1
                 peak = max(peak, active)
-            time.sleep(0.03)
+            all_started.wait(2)
             with lock:
                 active -= 1
             raise BiliRewardError("fake")
@@ -1157,9 +1159,9 @@ class UiTests(unittest.TestCase):
         with patch.object(self.service, "prepare_link_task", side_effect=prepare):
             worker.run()
         self.assertEqual(len(batches[0].results), 9)
-        self.assertEqual(peak, 4)
+        self.assertEqual(peak, 9)
 
-    def test_mock_batch_end_to_end_reuses_login_nav(self):
+    def test_mock_batch_end_to_end_uses_separate_task_clients(self):
         save_cookie_file(
             self.service.paths.cookie_file, {"SESSDATA": "fake", "bili_jct": "fake"}
         )
@@ -1190,7 +1192,7 @@ class UiTests(unittest.TestCase):
         with patch.object(BiliRewardClient, "_request_json", request):
             worker.run()
         self.assertEqual([r.status for r in batches[0].results], ["success", "success"])
-        self.assertEqual(counts, {"nav": 1, "info": 2})
+        self.assertEqual(counts, {"nav": 2, "info": 2})
 
 
 if __name__ == "__main__":

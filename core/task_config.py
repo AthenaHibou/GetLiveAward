@@ -11,7 +11,7 @@ from pathlib import Path
 from .models import RunSettings
 
 GLOBAL_FIELDS = frozenset({
-    "concurrent", "request_workers", "parallel_links", "link_workers",
+    "concurrent", "async_dispatch", "request_workers", "global_request_workers", "parallel_links", "link_workers",
     "time_sync_enabled", "time_server", "sync_interval_seconds", "global_interval_ms",
 })
 TASK_FIELDS = frozenset(asdict(RunSettings())) - GLOBAL_FIELDS

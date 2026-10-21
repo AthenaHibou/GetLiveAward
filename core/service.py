@@ -4,6 +4,7 @@ import threading
 import time
 import os
 from contextlib import contextmanager
+from dataclasses import replace
 
 from .auth import login_and_get_cookies
 from .clock_sync import NetworkClock
@@ -23,7 +24,7 @@ from .models import (
     PreparedLinkTask,
     RunSettings,
 )
-from .network import RequestLimiter
+from .network import RequestLimiter, TaskRequestLimiter
 from .storage import (
     ensure_runtime_dirs,
     get_runtime_paths,
@@ -43,7 +44,7 @@ class RewardService:
         self.paths = get_runtime_paths(base_dir, account_id)
         ensure_runtime_dirs(self.paths)
         self._login_lock = threading.Lock()
-        self._clients: dict[tuple[float, float], BiliRewardClient] = {}
+        self._clients: dict[tuple[object, float, float], BiliRewardClient] = {}
         self._all_clients: list[BiliRewardClient] = []
         self._cookie_text: str | None = None
         self._limiter = RequestLimiter()
@@ -66,16 +67,15 @@ class RewardService:
         """Apply an immutable settings snapshot before starting a batch."""
         if self._all_clients:
             raise RuntimeError("任务运行时不能修改请求设置")
-        self._limiter = RequestLimiter(settings.interval, settings.active_requests)
+        self._limiter = RequestLimiter(
+            settings.interval, settings.active_requests, max_tasks=settings.active_links,
+        )
         self.clock = NetworkClock()
 
     def create_logger(self, log_callback=None) -> EventLogger:
         logger = EventLogger(self.paths.log_file, log_callback=log_callback)
         self._loggers.append(logger)
         return logger
-
-    def check_batch_active(self) -> None:
-        self._limiter.check_blocked()
 
     def ensure_login(
         self,
@@ -104,7 +104,7 @@ class RewardService:
 
     def _client(self, options, logger, qr_callback, cancel_check, *, stale=None):
         with self._login_guard(cancel_check):
-            client_key = (options.timeout, options.retry_interval)
+            client_key = (options.execution_key or options.task_id, options.timeout, options.retry_interval)
             # A concurrent task may already have replaced this stale login generation.
             refresh = stale is not None and stale in self._clients.values()
             if refresh:
@@ -118,7 +118,7 @@ class RewardService:
             if self._cookie_text is not None:
                 client = self._new_client(options)
                 try:
-                    self.account_identity = client.ensure_logged_in(cancel_check=cancel_check) or {}
+                    self.account_identity = client.ensure_logged_in(cancel_check=cancel_check, log_callback=logger.log) or {}
                     logger.log("[Cookie] 登录状态验证通过")
                     self._clients[client_key] = client
                     return client
@@ -135,7 +135,7 @@ class RewardService:
             save_cookie_file(self.paths.cookie_file, cookies)
             self._cookie_text = format_cookies_text(cookies)
             client = self._new_client(options)
-            self.account_identity = client.ensure_logged_in(cancel_check=cancel_check) or {}
+            self.account_identity = client.ensure_logged_in(cancel_check=cancel_check, log_callback=logger.log) or {}
             self._clients[client_key] = client
             return client
 
@@ -143,7 +143,9 @@ class RewardService:
         client = BiliRewardClient(
             self._cookie_text or "",
             timeout=options.timeout,
-            limiter=self._limiter,
+            limiter=TaskRequestLimiter(
+                self._limiter, task_key=options.execution_key, priority=options.priority,
+            ),
             wall_time=self.clock.now,
             request_interval=options.retry_interval,
         )
@@ -172,7 +174,7 @@ class RewardService:
     ) -> None:
         BiliRewardClient._check_cancel(cancel_check)
         try:
-            self.account_identity = task.client.ensure_logged_in(cancel_check=cancel_check) or {}
+            self.account_identity = task.client.ensure_logged_in(cancel_check=cancel_check, log_callback=task.logger.log) or {}
         except BiliCookieInvalidError:
             task.client = self._client(
                 task.options, task.logger, qr_callback, cancel_check, stale=task.client
@@ -197,6 +199,15 @@ class RewardService:
         options = options or ClaimOptions(task_id=link_task.task_id)
         if options.task_id != link_task.task_id:
             raise ValueError("领取配置与链接的 task_id 不一致")
+        # Even duplicate links represent independent executions. Keep this key
+        # across login refreshes, but never reuse another row's blocked client.
+        options = replace(options, execution_key=object(), priority=link_task.index)
+        logger.log(
+            f"[运行参数] 领取线程={options.thread_count}, 全局在途上限={self._limiter.max_inflight}, "
+            f"任务间隔={options.retry_interval * 1000:g} ms, 全局最小间隔={self._limiter.interval * 1000:g} ms, "
+            f"每线程最多尝试={options.max_retry}, 时长限制={options.duration_seconds}秒, "
+            f"派发模式={'异步派发' if options.async_dispatch else '响应后等待'}"
+        )
         client, award_info = self._get_client_and_award_info(
             options,
             logger=logger,
@@ -251,6 +262,7 @@ class RewardService:
                     if deadline is None
                     else max(0.001, deadline - time.monotonic()),
                     jitter_ms=prepared_task.options.jitter_ms,
+                    async_dispatch=prepared_task.options.async_dispatch,
                     retry_budget=retry_budget,
                     cancel_check=cancelled,
                 )

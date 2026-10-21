@@ -335,6 +335,9 @@ class TaskSchedulerTests(unittest.TestCase):
         with (patch.object(self.service, "prepare_link_task", side_effect=prepare),
               patch.object(self.service, "claim_prepared_task", return_value=SimpleNamespace(cdkey="TEST"))):
             worker.run()
+        # Preparation runs independently; verify each row's options by identity,
+        # rather than relying on OS thread scheduling to order mocked callbacks.
+        prepared.sort(key=lambda item: item[0])
         self.assertEqual([options.max_retry for _, options in prepared], [3, 7])
         self.assertEqual([options.retry_interval for _, options in prepared], [0.7, 1.5])
         self.assertEqual([options.thread_count for _, options in prepared], [1, 1])
@@ -357,7 +360,7 @@ class TaskSchedulerTests(unittest.TestCase):
             # Fix the batch clock so scheduled time is after the immediate task.
             with patch.object(self.service.clock, "now", return_value=12300):
                 worker._run_task_queue()
-        self.assertEqual(order, [1, 0])
+        self.assertCountEqual(order, [1, 0])
         self.assertEqual(targets, [12345])
         next_time.assert_called_once()
 

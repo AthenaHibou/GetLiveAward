@@ -50,6 +50,8 @@ class ClaimWorker(QObject):
             item.index: ClaimExecutionControl() for item in link_tasks
         }
         self._prepared_loggers: dict[int, Any] = {}
+        self._batch_logger = None
+        self._clock_sync_lock = threading.Lock()
 
     def _check_wait_cancelled(self) -> None:
         if self._is_login_cancelled() or (
@@ -57,24 +59,39 @@ class ClaimWorker(QObject):
             and all(control.is_cancelled() for control in self._claim_controls.values())
         ):
             raise BiliRewardCancelledError("[定时] 已取消等待")
-        self.service.check_batch_active()
 
     def _sync_clock(self, timeout: float = 2.0) -> None:
-        self._check_wait_cancelled()
-        sample = self.service.clock.sync(self.settings.time_server, timeout)
-        message = f"已校时，偏差 {sample.offset * 1000:+.1f} ms，往返 {sample.round_trip * 1000:.1f} ms"
-        self.clock_status_changed.emit(message)
-        self._emit_batch_log(f"[校时] {self.settings.time_server}: {message}")
+        while not self._clock_sync_lock.acquire(timeout=0.05):
+            self._check_wait_cancelled()
+        try:
+            self._check_wait_cancelled()
+            # Tasks share a clock sample; simultaneous waiters need one refresh.
+            if self.service.clock.age() < 1.0:
+                return
+            sample = self.service.clock.sync(self.settings.time_server, timeout)
+            message = f"已校时，偏差 {sample.offset * 1000:+.1f} ms，往返 {sample.round_trip * 1000:.1f} ms"
+            self.clock_status_changed.emit(message)
+            self._emit_batch_log(f"[校时] {self.settings.time_server}: {message}")
+        finally:
+            self._clock_sync_lock.release()
 
     def _wait_scheduled(
         self, target: float, prepared: dict[int, PreparedLinkTask],
         task_settings: RunSettings | None = None,
     ) -> None:
         timing = task_settings or self.settings
+
+        def log(message):
+            if prepared:
+                for index in prepared:
+                    self._emit_link_log(index, message)
+            else:
+                self._emit_batch_log(message)
+
         formatted = datetime.fromtimestamp(target, BEIJING).strftime(
             "%Y-%m-%d %H:%M:%S.%f"
         )[:-3]
-        self._emit_batch_log(
+        log(
             f"[定时] 首发目标 {formatted}（北京时间）；后续执行方式 {timing.effective_retry_mode}"
         )
         self.status_changed.emit("定时等待中")
@@ -101,22 +118,22 @@ class ClaimWorker(QObject):
                         last_sync = time.monotonic()
                         continue
                     except BiliRewardError as exc:
-                        self._emit_batch_log(f"[校时] 过期样本刷新失败: {exc}")
+                        log(f"[校时] 过期样本刷新失败: {exc}")
                 raise BiliRewardError("[校时] 样本过期，停止定时任务，请检查时间服务器")
             if remaining <= 0:
-                self._emit_batch_log(
+                log(
                     f"[定时] 等待结束，唤醒偏差 {-remaining * 1000:+.3f} ms"
                     "（不含请求准备、限流等待与网络耗时）"
                 )
                 if remaining < -0.1:
-                    self._emit_batch_log(
+                    log(
                         f"[定时] 目标已过 {-remaining:.3f}s，立即开始（准备、网络或系统调度可能造成延迟）"
                     )
                 return
             if not warmed and remaining <= lead:
                 # Refresh login and WBI before the final window, never at first submit.
                 if time.monotonic() - prepared_at > 5:
-                    self._emit_batch_log("[定时] 临近目标，正在预热登录和签名密钥")
+                    log("[定时] 临近目标，正在预热登录和签名密钥")
                     for index, task in prepared.items():
                         if self._claim_controls[index].is_cancelled():
                             continue
@@ -147,12 +164,12 @@ class ClaimWorker(QObject):
                 try:
                     self._sync_clock(timeout=min(2.0, remaining - 0.5))
                 except BiliRewardError as exc:
-                    self._emit_batch_log(f"[校时] 本次失败，暂用上次样本: {exc}")
+                    log(f"[校时] 本次失败，暂用上次样本: {exc}")
                 last_sync = time.monotonic()
                 continue
             seconds = int(remaining)
             if seconds != last_remaining and (remaining <= 10 or seconds % 30 == 0):
-                self._emit_batch_log(f"[定时] 距首发约 {remaining:.1f}s")
+                log(f"[定时] 距首发约 {remaining:.1f}s")
                 last_remaining = seconds
             if remaining > 60:
                 self._cancel_event.wait(min(0.25, remaining))
@@ -209,10 +226,19 @@ class ClaimWorker(QObject):
         return self._login_cancel_event.is_set() or self._cancel_event.is_set()
 
     def _emit_batch_log(self, message: str) -> None:
-        self.log_message.emit(format_log_line(f"[批次] {message}"))
+        if self._batch_logger is not None:
+            self._batch_logger.log(f"[批次] {message}")
+        else:
+            self.log_message.emit(format_log_line(f"[批次] {message}"))
 
     def _emit_link_log(self, link_index: int, message: str) -> None:
-        self.log_message.emit(format_log_line(f"[链接{link_index + 1}] {message}"))
+        logger = self._prepared_loggers.get(link_index)
+        if logger is not None:
+            logger.log(message)
+        elif self._batch_logger is not None:
+            self._batch_logger.log(f"[链接{link_index + 1}] {message}")
+        else:
+            self.log_message.emit(format_log_line(f"[链接{link_index + 1}] {message}"))
 
     def _log_for_link(self, link_index: int, message: str) -> None:
         logger = self._prepared_loggers.get(link_index)
@@ -305,11 +331,16 @@ class ClaimWorker(QObject):
         return "失败"
 
     def _run_task_queue(self) -> list[SingleLinkClaimResult]:
-        """One shared account/limiter; each task keeps its own immutable options."""
+        """One execution per task; only authentication and HTTP pacing are shared."""
         settings = {task.index: with_globals(task.settings or self.settings, self.settings)
                     for task in self.link_tasks}
+        sync_error = None
         if any(item.sync_required for item in settings.values()):
-            self._sync_clock()
+            try:
+                self._sync_clock()
+            except BiliRewardError as exc:
+                sync_error = exc
+                self._emit_batch_log(f"[校时] 失败，仅影响需要校时的任务: {exc}")
         now = self.service.clock.now()
         targets = {task.index: next_scheduled_time(now, settings[task.index].scheduled_time,
                                                   settings[task.index].start_delay_ms)
@@ -320,12 +351,19 @@ class ClaimWorker(QObject):
             if task.index in targets:
                 target_text = datetime.fromtimestamp(targets[task.index], BEIJING).strftime("%m-%d %H:%M:%S.%f")[:-3]
                 self._emit_link_log(task.index, f"[定时] 本次目标 {target_text}（北京时间）")
-        self._emit_batch_log("任务独立设置；立即任务优先，定时任务按本次目标排序。同一时刻默认串行，前一条未结束会推迟后续任务。")
+        self._emit_batch_log("每条任务独立等待、执行和处理失败；共用全局请求并发上限及最小间隔，单条失败不停止其他任务。")
 
         def execute(task):
             try:
                 self._check_wait_cancelled()
                 self._claim_controls[task.index].check_cancelled()
+                if sync_error is not None and settings[task.index].sync_required:
+                    self._sync_clock()
+                    if task.index in targets:
+                        targets[task.index] = next_scheduled_time(
+                            self.service.clock.now(), settings[task.index].scheduled_time,
+                            settings[task.index].start_delay_ms,
+                        )
                 ready = self._prepare_link_task(task)
                 target = targets.get(task.index)
                 if target is not None:
@@ -339,113 +377,28 @@ class ClaimWorker(QObject):
                 self.link_status_changed.emit(task.index, "已取消" if cancelled else "失败")
                 return SingleLinkClaimResult(task.index, task.task_id, status, error=str(exc))
 
-        if self.settings.active_links == 1:
-            return [execute(task) for task in tasks]
-        with ThreadPoolExecutor(max_workers=min(self.settings.active_links, len(tasks))) as executor:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
             futures = [executor.submit(execute, task) for task in tasks]
             return [future.result() for future in as_completed(futures)]
 
     @pyqtSlot()
     def run(self) -> None:
         self.status_changed.emit("运行中")
-        self._emit_batch_log(f"共 {len(self.link_tasks)} 条链接，开始处理")
         results: list[SingleLinkClaimResult] = []
-        prepared: dict[int, PreparedLinkTask] = {}
-
-        def run_link(link_task):
-            try:
-                self._claim_controls[link_task.index].check_cancelled()
-                ready = prepared.pop(link_task.index, None) or self._prepare_link_task(
-                    link_task
-                )
-                return self._claim_prepared_task(ready)
-            except Exception as exc:
-                cancelled = isinstance(
-                    exc, (BiliRewardCancelledError, LoginCancelledError)
-                )
-                self._emit_link_log(
-                    link_task.index, f"[任务] 预处理结束: {type(exc).__name__}: {exc}"
-                )
-                self.link_status_changed.emit(
-                    link_task.index, "已取消" if cancelled else "失败"
-                )
-                return SingleLinkClaimResult(
-                    link_task.index,
-                    link_task.task_id,
-                    "cancelled" if cancelled else "failed",
-                    error=str(exc),
-                )
-
         try:
-            individual = any(task.settings is not None for task in self.link_tasks)
-            self.service.configure(replace(self.settings, interval_ms=self.settings.global_interval_ms)
-                                   if individual else self.settings)
-            if individual and self.link_tasks:
-                results.extend(self._run_task_queue())
-                return
-            target = None
-            if self.settings.sync_required:
-                self._sync_clock()
-            if self.settings.retry_mode == "scheduled":
-                target = next_scheduled_time(
-                    self.service.clock.now(),
-                    self.settings.scheduled_time,
-                    self.settings.start_delay_ms,
-                )
+            self._batch_logger = self.service.create_logger(self.log_message.emit)
+            self._emit_batch_log(
+                f"共 {len(self.link_tasks)} 条链接，开始处理；启用请求并发={self.settings.concurrent}, "
+                f"异步派发={self.settings.async_dispatch}, "
+                f"多任务异步派发={self.settings.parallel_links}, "
+                f"每任务领取线程={self.settings.task_request_workers}, "
+                f"请求并发上限={self.settings.active_requests}, 同时在途任务上限={self.settings.active_links}, "
+                f"独立任务数={len(self.link_tasks)}, "
+                f"全局最小间隔={self.settings.global_interval_ms} ms"
+            )
+            self.service.configure(replace(self.settings, interval_ms=self.settings.global_interval_ms))
             if self.link_tasks:
-                self._emit_batch_log(
-                    f"运行设置: 同时链接={self.settings.active_links}, 请求并发上限={self.settings.active_requests}, "
-                    f"间隔={self.settings.interval_ms}ms, 执行方式={self.settings.retry_mode}, "
-                    f"次数={self.settings.max_retry}, 时长={self.settings.duration_minutes:g}分钟"
-                )
-                if self.settings.active_links == 1:
-                    self._emit_batch_log(
-                        "按输入顺序逐条执行；上一条结束或取消后才处理下一条"
-                    )
-                for task in self.link_tasks:
-                    self.link_status_changed.emit(task.index, "排队中")
-                if target is not None:
-                    self._emit_batch_log(
-                        "[定时] 提前准备首批链接；等待期间不会提交领取"
-                    )
-                    for task in self.link_tasks:
-                        try:
-                            self._check_wait_cancelled()
-                            self._claim_controls[task.index].check_cancelled()
-                            prepared[task.index] = self._prepare_link_task(task)
-                        except BiliRewardError as exc:
-                            cancelled = isinstance(
-                                exc, (BiliRewardCancelledError, LoginCancelledError)
-                            )
-                            results.append(
-                                SingleLinkClaimResult(
-                                    task.index,
-                                    task.task_id,
-                                    "cancelled" if cancelled else "failed",
-                                    error=str(exc),
-                                )
-                            )
-                            self.link_status_changed.emit(
-                                task.index, "已取消" if cancelled else "失败"
-                            )
-                        if len(prepared) >= self.settings.active_links:
-                            break
-                    if prepared:
-                        self._wait_scheduled(target, prepared)
-                completed = {result.index for result in results}
-                tasks = [
-                    task for task in self.link_tasks if task.index not in completed
-                ]
-                if self.settings.active_links == 1:
-                    for task in tasks:
-                        results.append(run_link(task))
-                elif tasks:
-                    with ThreadPoolExecutor(
-                        max_workers=min(self.settings.active_links, len(tasks))
-                    ) as executor:
-                        futures = [executor.submit(run_link, task) for task in tasks]
-                        for future in as_completed(futures):
-                            results.append(future.result())
+                results.extend(self._run_task_queue())
             else:
                 self._emit_batch_log("没有可执行的链接")
         except Exception as exc:
@@ -466,12 +419,13 @@ class ClaimWorker(QObject):
                         task.index, "已取消" if cancelled else "失败"
                     )
         finally:
+            sorted_results = sorted(results, key=lambda item: item.index)
+            self._emit_batch_log("全部链接处理完成")
             try:
                 self.service.close()
             except Exception as exc:
-                self._emit_batch_log(f"资源清理异常: {type(exc).__name__}")
-            sorted_results = sorted(results, key=lambda item: item.index)
-            self._emit_batch_log("全部链接处理完成")
+                self.log_message.emit(format_log_line(f"[批次] 资源清理异常: {type(exc).__name__}"))
+            self._batch_logger = None
             self.batch_completed.emit(BatchClaimResult(results=sorted_results))
             self.status_changed.emit(self._resolve_batch_status(sorted_results))
             self.finished.emit()
