@@ -134,8 +134,129 @@ class AsyncDispatchTests(unittest.TestCase):
             self.assertEqual(future.result(2), (AWARD, None))
         self.assertEqual(request.call_count, 1)
 
+    def test_terminal_response_stops_queued_peer_before_delayed_response_log_finishes(self):
+        responses = [
+            ({"code": 0, "data": {"extra_info": {"cdkey_content": key}}}, key)
+            for key in (None, "TEST-KEY")
+        ] + [({"code": 75255, "message": "库存已经使用完"}, None)] + [
+            ({"code": code, "message": "terminal failure"}, None) for code in (-400, -404, -405)
+        ]
+        for scoped in (False, True):
+            for asynchronous in (False, True):
+                for payload, key in responses:
+                    with self.subTest(scoped=scoped, async_dispatch=asynchronous, response=payload):
+                        shared = RequestLimiter(0, 1, max_tasks=1)
+                        self.client.limiter = TaskRequestLimiter(shared) if scoped else shared
+                        peer_entered, peer_processed = threading.Event(), threading.Event()
+                        signed_calls, submissions, checks = [], [], []
+                        first_context = []
+                        lock = threading.Lock()
+                        original_signed = self.client._signed_request
 
+                        def signed(*args, **kwargs):
+                            with lock:
+                                signed_calls.append(True)
+                                if len(signed_calls) == 2:
+                                    peer_entered.set()
+                            return original_signed(*args, **kwargs)
 
+                        def perform(*args):
+                            with lock:
+                                submissions.append(True)
+                                first = len(submissions) == 1
+                            if first:
+                                first_context.append(self.client._local.claim_context)
+                                checks.append(peer_entered.wait(1))
+                            else:
+                                peer_processed.set()
+                            return payload
+
+                        def log(message):
+                            if "[请求-未发送]" in message:
+                                peer_processed.set()
+                            if ("[请求-响应]" in message and first_context
+                                    and first_context[0] in message):
+                                # Keep the successful worker inside logging until
+                                # its peer has either stopped or incorrectly sent.
+                                checks.append(peer_processed.wait(1))
+
+                        with (patch.object(self.client, "_signed_request", side_effect=signed),
+                              patch.object(self.client, "get_web_sign", return_value="test=1"),
+                              patch.object(self.client, "_perform_request", side_effect=perform)):
+                            options = dict(award_info=AWARD, thread_count=2, max_retry=1,
+                                           retry_interval=0.01, async_dispatch=asynchronous, log_callback=log)
+                            if payload["code"] == 0:
+                                result = self.client.claim_award("task", **options)
+                            else:
+                                with self.assertRaises(BiliRewardError):
+                                    self.client.claim_award("task", **options)
+                        self.assertEqual(checks, [True, True])
+                        self.assertEqual(len(submissions), 1)
+                        if payload["code"] == 0:
+                            self.assertEqual(result, (AWARD, key))
+
+    def test_success_stops_peer_admitted_but_still_inside_send_log(self):
+        shared = RequestLimiter(0, 2, max_tasks=1)
+        self.client.limiter = TaskRequestLimiter(shared)
+        second_logging, response_logged = threading.Event(), threading.Event()
+        sends, submissions, checks = [], [], []
+        lock = threading.Lock()
+
+        def log(message):
+            if "[请求-发送]" in message:
+                with lock:
+                    sends.append(True)
+                    second = len(sends) == 2
+                if second:
+                    second_logging.set()
+                    checks.append(response_logged.wait(1))
+            elif "[请求-响应]" in message:
+                response_logged.set()
+
+        def perform(*args):
+            submissions.append(True)
+            checks.append(second_logging.wait(1))
+            return SUCCESS
+
+        with (patch.object(self.client, "get_web_sign", return_value="test=1"),
+              patch.object(self.client, "_perform_request", side_effect=perform)):
+            result = self.client.claim_award(
+                "task", award_info=AWARD, thread_count=2, max_retry=1,
+                retry_interval=0.01, async_dispatch=True, log_callback=log,
+            )
+        self.assertEqual(checks, [True, True])
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(result, (AWARD, None))
+
+    def test_nav_success_and_retryable_claim_responses_do_not_stop_claim(self):
+        for failure, stop_stock in (
+            ({"code": 75255, "message": "库存已经使用完"}, False),
+            ({"code": 202032, "message": "库存不足，无资格"}, True),
+            ({"code": -403, "message": "signature expired"}, True),
+        ):
+            with self.subTest(response=failure, stop_sold_out=stop_stock):
+                self.client.limiter = TaskRequestLimiter(RequestLimiter(0))
+                claims, navs = [], []
+                def sign(*args):
+                    self.client._request_json(NAV_URL)
+                    return "test=1"
+                def perform(url, *args):
+                    if url == NAV_URL:
+                        navs.append(True)
+                        return SUCCESS
+                    claims.append(True)
+                    return failure if len(claims) == 1 else SUCCESS
+                with (patch.object(self.client, "get_web_sign", side_effect=sign),
+                      patch.object(self.client, "_perform_request", side_effect=perform)):
+                    result = self.client.claim_award(
+                        "task", award_info=AWARD, thread_count=1, max_retry=2,
+                        retry_interval=0, stop_sold_out=stop_stock,
+                    )
+                self.assertEqual(result, (AWARD, None))
+                self.assertEqual(len(claims), 2)
+                self.assertEqual(len(navs), 2)
+                self.assertIsNone(self.client._local.claim_stop)
+                self.assertIsNone(self.client._local.claim_terminal_response)
 
     def test_cancellation_and_duration_stop_pending_dispatch(self):
         for timed in (False, True):

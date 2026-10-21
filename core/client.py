@@ -173,9 +173,19 @@ class BiliRewardClient:
                         f"并发槽等待={wait.slot_seconds * 1000:.3f} ms, "
                         f"间隔限流等待={wait.interval_seconds * 1000:.3f} ms"
                     )
+                claim_stop = getattr(self._local, "claim_stop", None)
+                if claim_stop is not None and claim_stop.is_set():
+                    raise _ClaimStopped("任务已结束")
                 started = time.perf_counter()
                 payload = self._perform_request(url, data, headers)
                 self._local.api_code = payload.get("code")
+                # Publish terminal claim responses before releasing HTTP capacity
+                # or invoking logs; queued peers must not submit during logging.
+                terminal_response = getattr(self._local, "claim_terminal_response", None)
+                if (claim_stop is not None and terminal_response is not None
+                        and url.split("?", 1)[0] == MISSION_RECEIVE_URL
+                        and terminal_response(payload)):
+                    claim_stop.set()
                 return payload
         except Exception as exc:
             outcome = type(exc).__name__
@@ -442,6 +452,22 @@ class BiliRewardClient:
         ).encode("utf-8")
         stop = threading.Event()
 
+        def sold_out(code, message) -> bool:
+            return stop_sold_out and code != 202032 and any(
+                marker in str(message) for marker in (
+                    "库存不足", "库存已耗尽", "库存已用完", "库存已经使用完",
+                    "每日库存已达上限", "奖励已领完", "奖品已领完", "奖励已抢完", "奖品已抢完",
+                )
+            )
+
+        def terminal_response(payload) -> bool:
+            code = payload.get("code", -1)
+            # -403 has a signed-request key refresh retry, so only its final
+            # failure stops the claim in the worker below.
+            if code == -403:
+                return False
+            return code in (0, -400, -404, -405) or sold_out(code, payload.get("message", ""))
+
         deadline = (
             None if duration_seconds is None else time.monotonic() + duration_seconds
         )
@@ -498,6 +524,8 @@ class BiliRewardClient:
         def worker(worker_id: int) -> str | None:
             self._local.check = check
             self._local.log_callback = log_callback
+            self._local.claim_stop = stop
+            self._local.claim_terminal_response = terminal_response
             last_error = ""
             network_failures = 0
             try:
@@ -551,24 +579,7 @@ class BiliRewardClient:
                         # let it follow the normal bounded retry path.
                         if code in (-400, -403, -404, -405):
                             raise error
-                        if (
-                            stop_sold_out
-                            and code != 202032
-                            and any(
-                                marker in str(message)
-                                for marker in (
-                                    "库存不足",
-                                    "库存已耗尽",
-                                    "库存已用完",
-                                    "库存已经使用完",
-                                    "每日库存已达上限",
-                                    "奖励已领完",
-                                    "奖品已领完",
-                                    "奖励已抢完",
-                                    "奖品已抢完",
-                                )
-                            )
-                        ):
+                        if sold_out(code, message):
                             raise BiliRewardError(f"[库存] 停止该链接: {last_error}")
                         network_failures = 0
                     except BiliRequestError as exc:
@@ -603,6 +614,8 @@ class BiliRewardClient:
                 self._local.check = None
                 self._local.log_callback = None
                 self._local.claim_context = ""
+                self._local.claim_stop = None
+                self._local.claim_terminal_response = None
                 self._close_thread_session()
 
         if thread_count == 1:
