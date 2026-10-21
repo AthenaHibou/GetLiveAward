@@ -6,6 +6,10 @@ Bilibili 直播奖励领取桌面工具。支持扫码登录、多个账号档�
 
 从源码运行需要 Python 3.10 或更新版本（建议 Python 3.12）：
 
+Windows 开发时可直接双击根目录的 `start_dev.bat`：自动切换到项目目录并使用 `.venv`，首次运行自动创建环境、安装依赖。修改代码后关闭程序，再运行脚本即可加载最新源码；启动失败时控制台会保留报错。开发运行使用项目内的 `data/`，与其他目录下的打包程序数据分别保存。
+
+也可以手动启动：
+
 ```powershell
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
@@ -74,6 +78,7 @@ B 站返回 `202032`（无资格领取奖励）时，程序按设置继续重试
 ## 来源与许可
 
 本项目基于 [yuzeeesama/GetLiveAward](https://github.com/yuzeeesama/GetLiveAward)，并保留本地 Git 提交历史以记录来源和后续改动。
+
 
 上游仓库当前没有声明开源许可证。本文中的来源说明用于致谢，不代表授予代码再发布或商用许可。重新分发上游代码或二进制前，请先确认适用的授权。
 
