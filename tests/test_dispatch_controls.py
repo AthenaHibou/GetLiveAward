@@ -203,6 +203,31 @@ class DispatchUiTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(checks, [True])
 
+    def test_task_area_grows_with_window_and_splitter_position_is_saved(self):
+        window = self.window
+        window._settings.setValue("onboarding/hidden", True)
+        for _ in range(4):
+            window.add_link_row()
+        window.resize(1100, 720)
+        window.show()
+        self.app.processEvents()
+        before = window.link_scroll.height()
+        window.resize(1100, 1000)
+        self.app.processEvents()
+        self.assertGreater(window.link_scroll.height(), before + 100)
+        window.task_log_splitter.moveSplitter(390, 1)
+        self.app.processEvents()
+        split_sizes = window.task_log_splitter.sizes()
+        self.assertGreater(split_sizes[1], 200)
+        self.assertIsNotNone(window._settings.value("layout/task_log_splitter"))
+        window.close()
+        reopened = MainWindow(RewardService(self.root.name))
+        self.addCleanup(reopened.close)
+        reopened.resize(1100, 1000)
+        reopened.show()
+        self.app.processEvents()
+        restored = reopened.task_log_splitter.sizes()
+        self.assertAlmostEqual(split_sizes[0] / sum(split_sizes), restored[0] / sum(restored), delta=0.06)
 
     def test_multi_task_async_http_can_overlap_without_extra_task_workers(self):
         service = self.window.service

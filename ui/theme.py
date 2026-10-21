@@ -375,7 +375,7 @@ QFrame[cssClass="card"] {{
     background-color: {CARD_BG};
     border: 1.5px solid {BORDER};
     border-radius: {_scale(s, 14)};
-    padding: {_scale(s, 14)};
+    padding: 0px;
 }}
 QFrame[cssClass="card"][selectedTask="true"] {{
     border-color: #A9DDEA;
@@ -386,6 +386,15 @@ QFrame[cssClass="sep"] {{
     border: none;
     background-color: {BORDER};
     max-height: 1px;
+}}
+
+QSplitter#taskLogSplitter::handle:vertical {{
+    background: {BORDER};
+    margin: {_scale(s, 3)} {_scale(s, 36)};
+    border-radius: {_scale(s, 2)};
+}}
+QSplitter#taskLogSplitter::handle:vertical:hover {{
+    background: {BLUE};
 }}
 
 /* ── QMessageBox ─────────────────────────────── */

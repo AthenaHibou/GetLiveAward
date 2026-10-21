@@ -19,6 +19,8 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QScrollArea,
+    QSplitter,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -208,7 +210,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         self.rows_container = QWidget(root)
         self.rows_wrap = QVBoxLayout(self.rows_container)
         self.rows_wrap.setContentsMargins(0, 0, 0, 0)
-        self.rows_wrap.setSpacing(round(12 * theme.SCALE))
+        self.rows_wrap.setSpacing(round(8 * theme.SCALE))
         self.rows_wrap.addStretch()
         self.link_scroll = QScrollArea(root)
         self.link_scroll.setWidgetResizable(True)
@@ -247,15 +249,43 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         layout.addWidget(self.flow_hint)
         body = QHBoxLayout()
         body.setSpacing(round(18 * theme.SCALE))
-        left = QVBoxLayout()
-        left.setSpacing(round(9 * theme.SCALE))
-        left.addWidget(links_title)
-        left.addWidget(links_hint)
-        left.addLayout(task_toolbar)
-        left.addWidget(self.link_scroll)
-        left.addLayout(log_header)
-        left.addWidget(self.log_text, 1)
-        body.addLayout(left, 1)
+        task_pane = QWidget()
+        task_pane.setMinimumHeight(round(190 * theme.SCALE))
+        task_layout = QVBoxLayout(task_pane)
+        task_layout.setContentsMargins(0, 0, 0, 0)
+        task_layout.setSpacing(round(8 * theme.SCALE))
+        task_layout.addWidget(links_title)
+        task_layout.addWidget(links_hint)
+        task_layout.addLayout(task_toolbar)
+        task_layout.addWidget(self.link_scroll, 1)
+        log_pane = QWidget()
+        log_pane.setMinimumHeight(round(120 * theme.SCALE))
+        log_layout = QVBoxLayout(log_pane)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(round(8 * theme.SCALE))
+        log_layout.addLayout(log_header)
+        log_layout.addWidget(self.log_text, 1)
+        self.task_log_splitter = QSplitter(Qt.Vertical)
+        self.task_log_splitter.setObjectName("taskLogSplitter")
+        self.task_log_splitter.setChildrenCollapsible(False)
+        self.task_log_splitter.setHandleWidth(round(10 * theme.SCALE))
+        self.task_log_splitter.addWidget(task_pane)
+        self.task_log_splitter.addWidget(log_pane)
+        self.task_log_splitter.setStretchFactor(0, 2)
+        self.task_log_splitter.setStretchFactor(1, 1)
+        self.task_log_splitter.setSizes([640, 360])
+        handle = self.task_log_splitter.handle(1)
+        handle.setCursor(Qt.SplitVCursor)
+        handle.setToolTip("上下拖动，调整任务列表与日志区域；位置自动保存")
+        saved_splitter = self._settings.value("layout/task_log_splitter")
+        if saved_splitter is not None:
+            self.task_log_splitter.restoreState(saved_splitter)
+        self.task_log_splitter.splitterMoved.connect(
+            lambda *_: self._settings.setValue(
+                "layout/task_log_splitter", self.task_log_splitter.saveState()
+            )
+        )
+        body.addWidget(self.task_log_splitter, 1)
         body.addWidget(self.settings_panel)
         layout.addLayout(body, 1)
 
@@ -390,9 +420,10 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         _css(frame, "card")
 
         card_layout = QVBoxLayout(frame)
-        card_layout.setContentsMargins(round(16 * theme.SCALE), round(10 * theme.SCALE), round(16 * theme.SCALE), round(10 * theme.SCALE))
-        card_layout.setSpacing(round(6 * theme.SCALE))
+        card_layout.setContentsMargins(round(12 * theme.SCALE), round(8 * theme.SCALE), round(12 * theme.SCALE), round(8 * theme.SCALE))
+        card_layout.setSpacing(round(4 * theme.SCALE))
         row = QHBoxLayout()
+        header_row = row
         card_layout.addLayout(row)
         row.setSpacing(round(12 * theme.SCALE))
         enabled = QCheckBox()
@@ -411,7 +442,9 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         name_edit.setPlaceholderText("任务名称")
         name_edit.setAccessibleName("任务名称")
         name_edit.setProperty("cssClass", "taskName")
-        row.addWidget(name_edit, 1)
+        name_edit.setMinimumWidth(round(70 * theme.SCALE))
+        name_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        row.addWidget(name_edit, 2)
         status_lbl = QLabel(self.STATUS_IDLE)
         _css(status_lbl, "dim")
         status_lbl.setMinimumWidth(round(64 * theme.SCALE))
@@ -432,11 +465,12 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         rem_btn = _icon_btn("−", frame)
         row.addWidget(rem_btn)
 
-        row = QHBoxLayout()
-        card_layout.addLayout(row)
+        row = header_row
         summary = QLabel()
         summary.setProperty("cssClass", "taskSummary")
-        row.addWidget(summary, 1)
+        summary.setMinimumWidth(0)
+        summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        row.insertWidget(3, summary, 2)
         settings_btn = _btn("设置", "taskAction", frame)
         row.addWidget(settings_btn)
         run_btn = _btn("运行", "taskRun", frame)
@@ -512,20 +546,6 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
             rw.name_edit.setEnabled(not self._is_running)
             rw.enabled.setEnabled(not self._is_running)
             self._sync_row_action_buttons(i)
-        # Fit a single row snugly; extra links scroll instead of squeezing the log.
-        content_height = sum(rw.frame.sizeHint().height() for rw in self.link_rows)
-        content_height += self.rows_wrap.spacing() * max(0, len(self.link_rows) - 1)
-        maximum = round(220 * theme.SCALE)
-        if self.link_scroll.y() > 0:
-            # Keep room for the log header and log even at the minimum window size.
-            maximum = min(maximum, max(round(100 * theme.SCALE),
-                          self.centralWidget().height() - self.link_scroll.y() - round(150 * theme.SCALE)))
-        self.link_scroll.setFixedHeight(min(content_height + 2, maximum))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "link_scroll"):
-            QTimer.singleShot(0, self._refresh_link_rows)
 
     # ── URL parsing ─────────────────────────────────────
     def eventFilter(self, watched, event):
@@ -841,6 +861,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         except ValueError:
             self.append_ui_log("[设置] 无效设置未保存")
         self._save_timer.stop()
+        self._settings.setValue("layout/task_log_splitter", self.task_log_splitter.saveState())
         self._autosave_workspace()
         self.service.close()
         super().closeEvent(event)
