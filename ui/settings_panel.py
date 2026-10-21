@@ -5,6 +5,7 @@ from html import escape
 
 from PyQt5.QtCore import QSettings, Qt, QTime, pyqtSignal
 from PyQt5.QtWidgets import (
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -22,7 +23,7 @@ from PyQt5.QtWidgets import (
 
 from core.models import RunSettings
 from ui import theme
-from ui.controls import SoftComboBox
+from ui.controls import SoftComboBox, require_click_to_wheel
 
 
 class SettingsPanel(QWidget):
@@ -242,6 +243,8 @@ class SettingsPanel(QWidget):
         # plain tooltips which can span the entire desktop as one long line.
         tooltip_width = round(300 * theme.SCALE)
         for widget in content.findChildren(QWidget):
+            if isinstance(widget, (QAbstractSpinBox, QComboBox)):
+                require_click_to_wheel(widget)
             if widget.toolTip():
                 body = escape(widget.toolTip()).replace("\n", "<br>")
                 widget.setToolTip(

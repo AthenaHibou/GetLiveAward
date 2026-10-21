@@ -34,6 +34,7 @@ from core.errors import BiliRewardError
 from ui.qr_dialog import QrCodeDialog
 from ui.onboarding import OnboardingOverlay
 from ui.settings_panel import SettingsPanel
+from ui.log_highlighter import LogHighlighter, LOG_NORMAL, LOG_SUCCESS, LOG_FAILURE
 from ui import theme
 from ui.worker import ClaimWorker, LoginWorker
 from ui.controls import SoftComboBox
@@ -222,6 +223,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
 
         # Log area
         self.log_text = QPlainTextEdit(root)
+        self.log_highlighter = LogHighlighter(self.log_text.document())
         self.log_text.setMaximumBlockCount(2000)
         self.log_text.setReadOnly(True)
         self.log_text.setPlaceholderText("还没有运行记录\n\n首次使用：点击「登录当前账号」验证或扫码，不会提交领取。\n已登录：开放前手动开始，或选择定时执行。")
@@ -826,7 +828,9 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         self.append_ui_log(f"[批次] 完成 — 成功 {sc} / 失败 {fc} / 取消 {cc}")
         if not self._closing:
             QMessageBox.information(self, "批次完成",
-                f"成功 {sc} 条\n失败 {fc} 条\n取消 {cc} 条")
+                f'<span style="color: {LOG_SUCCESS}">成功 {sc} 条</span><br>'
+                f'<span style="color: {LOG_FAILURE}">失败 {fc} 条</span><br>'
+                f'<span style="color: {LOG_NORMAL}">取消 {cc} 条</span>')
 
     def on_worker_finished(self) -> None:
         was_login_check = isinstance(self.worker, LoginWorker)
