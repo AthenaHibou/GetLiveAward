@@ -8,7 +8,7 @@ from dataclasses import replace
 
 from .auth import login_and_get_cookies
 from .clock_sync import NetworkClock
-from .accounts import DEFAULT_ACCOUNT
+from .accounts import AccountStore, DEFAULT_ACCOUNT
 from .client import BiliRewardClient, format_cookies_text
 from .errors import BiliCookieInvalidError, BiliRewardError, BiliRewardTimeoutError
 from .logging_utils import EventLogger, ScopedLogger
@@ -94,6 +94,36 @@ class RewardService:
         )
         logger.log("[Cookie] 登录状态验证通过，可以等待奖励开放后开始领取")
 
+    def scan_new_account(self, *, log_callback=None, qr_callback=None, cancel_check=None,
+                         timeout: float = 10.0, ignore_risk_control: bool = False) -> tuple[dict, dict]:
+        """Verify a fresh QR login in memory, without touching the active profile."""
+        logger = self.create_logger(log_callback)
+        cookies = login_and_get_cookies(log_callback=logger.log, qr_callback=qr_callback, cancel_check=cancel_check)
+        BiliRewardClient._check_cancel(cancel_check)
+        client = BiliRewardClient(format_cookies_text(cookies), timeout=timeout,
+                                  ignore_risk_control=ignore_risk_control)
+        try:
+            identity = client.ensure_logged_in(cancel_check=cancel_check, log_callback=logger.log)
+            if not isinstance(identity, dict) or not AccountStore.normalize_uid(identity.get("mid")):
+                raise BiliRewardError("登录验证未返回有效 UID，请重新扫码")
+            BiliRewardClient._check_cancel(cancel_check)
+            return cookies, identity
+        finally:
+            client.close()
+
+    def _check_account_identity(self, identity) -> dict:
+        identity = identity if isinstance(identity, dict) else {}
+        try:
+            expected = AccountStore(self.root_paths.data_dir).uid_for(self.account_id)
+        except BiliRewardError:
+            # Keep the legacy default login usable if the account index is damaged.
+            cookies = load_cookie_file(self.paths.cookie_file) or {}
+            expected = AccountStore.normalize_uid(cookies.get("DedeUserID"))
+        expected = expected or AccountStore.normalize_uid(self.account_identity.get("mid"))
+        if expected and AccountStore.normalize_uid(identity.get("mid")) != expected:
+            raise BiliRewardError("扫码账号与当前档案不一致，请使用原账号重新扫码，或点击「添加账号」；原登录和配置未覆盖")
+        return identity
+
     @contextmanager
     def _login_guard(self, cancel_check):
         while not self._login_lock.acquire(timeout=0.05):
@@ -120,7 +150,8 @@ class RewardService:
             if self._cookie_text is not None:
                 client = self._new_client(options)
                 try:
-                    self.account_identity = client.ensure_logged_in(cancel_check=cancel_check, log_callback=logger.log) or {}
+                    self.account_identity = self._check_account_identity(
+                        client.ensure_logged_in(cancel_check=cancel_check, log_callback=logger.log))
                     logger.log("[Cookie] 登录状态验证通过")
                     self._clients[client_key] = client
                     return client
@@ -134,16 +165,20 @@ class RewardService:
                 cancel_check=cancel_check,
             )
             BiliRewardClient._check_cancel(cancel_check)
+            cookie_text = format_cookies_text(cookies)
+            client = self._new_client(options, cookie_text=cookie_text)
+            identity = self._check_account_identity(
+                client.ensure_logged_in(cancel_check=cancel_check, log_callback=logger.log))
+            BiliRewardClient._check_cancel(cancel_check)
             save_cookie_file(self.paths.cookie_file, cookies)
-            self._cookie_text = format_cookies_text(cookies)
-            client = self._new_client(options)
-            self.account_identity = client.ensure_logged_in(cancel_check=cancel_check, log_callback=logger.log) or {}
+            self._cookie_text = cookie_text
+            self.account_identity = identity
             self._clients[client_key] = client
             return client
 
-    def _new_client(self, options):
+    def _new_client(self, options, *, cookie_text=None):
         client = BiliRewardClient(
-            self._cookie_text or "",
+            cookie_text if cookie_text is not None else self._cookie_text or "",
             timeout=options.timeout,
             limiter=TaskRequestLimiter(
                 self._limiter, task_key=options.execution_key, priority=options.priority,
@@ -177,7 +212,8 @@ class RewardService:
     ) -> None:
         BiliRewardClient._check_cancel(cancel_check)
         try:
-            self.account_identity = task.client.ensure_logged_in(cancel_check=cancel_check, log_callback=task.logger.log) or {}
+            self.account_identity = self._check_account_identity(
+                task.client.ensure_logged_in(cancel_check=cancel_check, log_callback=task.logger.log))
         except BiliCookieInvalidError:
             task.client = self._client(
                 task.options, task.logger, qr_callback, cancel_check, stale=task.client

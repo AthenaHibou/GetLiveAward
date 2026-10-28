@@ -768,13 +768,11 @@ class UiTests(unittest.TestCase):
             patch.object(window, "start_login") as login,
             patch.object(self.service, "prepare_link_task") as claim,
         ):
-            window.add_account_named("账号二")
-        login.assert_called_once()
+            window.add_account()
+        login.assert_called_once_with(add_account=True)
         claim.assert_not_called()
-        self.assertNotEqual(window.service.account_id, "default")
-        self.assertEqual(window.account_combo.currentText(), "账号二（待登录）")
-        self.assertEqual(window.login_status.text(), "账号待登录")
-        self.assertIsNone(load_cookie_file(window.service.paths.cookie_file))
+        self.assertEqual(window.service.account_id, "default")
+        self.assertEqual(window.account_combo.count(), 1)
         self.assertEqual(
             load_cookie_file(self.service.paths.cookie_file)["SESSDATA"], "original"
         )
@@ -784,8 +782,9 @@ class UiTests(unittest.TestCase):
         window = MainWindow(self.service)
         window.settings_panel.apply(RunSettings(interval_ms=750))
         window.append_ui_log("DEFAULT-ONLY-LOG")
-        with patch.object(window, "start_login"):
-            window.add_account_named("账号二")
+        added = window.account_store.add("账号二")
+        window._reload_account_profiles()
+        window._activate_account(added.account_id)
         second_id = window.service.account_id
         self.assertNotIn("DEFAULT-ONLY-LOG", window.log_text.toPlainText())
         self.assertEqual(window.settings_panel.snapshot().interval_ms, 1000)
@@ -803,8 +802,9 @@ class UiTests(unittest.TestCase):
 
     def test_running_login_blocks_account_addition_and_switch(self):
         window = MainWindow(self.service)
-        with patch.object(window, "start_login"):
-            window.add_account_named("账号二")
+        added = window.account_store.add("账号二")
+        window._reload_account_profiles()
+        window._activate_account(added.account_id)
         second_id = window.service.account_id
         window.account_combo.setCurrentIndex(window.account_combo.findData("default"))
 
@@ -822,8 +822,8 @@ class UiTests(unittest.TestCase):
                 window.account_combo.findData(second_id)
             )
             self.assertEqual(window.service.account_id, "default")
-            with self.assertRaises(ValueError):
-                window.add_account_named("账号三")
+            window.add_account()
+            self.assertEqual(len(window.account_store.list_profiles()), 2)
             window.close()
             deadline = time.monotonic() + 2
             while window.worker_thread is not None and time.monotonic() < deadline:

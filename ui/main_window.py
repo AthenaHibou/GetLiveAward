@@ -13,7 +13,6 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QInputDialog,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -99,6 +98,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         self._is_running = False
         self._login_verified = False
         self._login_checking = False
+        self._adding_account = False
         self._closing = False
         self._current_qr_link_index: int | None = None
         self._row_claim_stage_active: dict[int, bool] = {}
@@ -188,9 +188,10 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         self.account_combo.setAccessibleName("当前账号")
         for profile in self._account_profiles:
             self.account_combo.addItem(self._account_display_name(profile), profile.account_id)
+            self.account_combo.setItemData(self.account_combo.count() - 1, self._account_tooltip(profile), Qt.ToolTipRole)
         self.account_combo.currentIndexChanged.connect(self._account_changed)
         self.add_account_btn = _btn("添加账号", "helpBtn", root)
-        self.add_account_btn.setToolTip("创建独立账号档案并扫码登录，不会启动领取")
+        self.add_account_btn.setToolTip("直接扫码添加，自动使用昵称和 UID；已添加的账号会更新登录并切换，不会启动领取")
         self.add_account_btn.clicked.connect(self.add_account)
         self.account_combo.setEnabled(not self._account_error)
         self.add_account_btn.setEnabled(not self._account_error)
@@ -302,6 +303,23 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
             return f"{profile.name}（待登录）"
         return profile.name
 
+    @staticmethod
+    def _account_tooltip(profile: AccountProfile) -> str:
+        return f"{profile.name}\n原备注：{profile.remark}" if profile.remark else profile.name
+
+    def _reload_account_profiles(self) -> None:
+        self._account_profiles = self.account_store.list_profiles()
+        self.account_combo.blockSignals(True)
+        try:
+            self.account_combo.clear()
+            for profile in self._account_profiles:
+                self.account_combo.addItem(self._account_display_name(profile), profile.account_id)
+                self.account_combo.setItemData(self.account_combo.count() - 1, self._account_tooltip(profile), Qt.ToolTipRole)
+            self.account_combo.setCurrentIndex(self.account_combo.findData(self.service.account_id))
+        finally:
+            self.account_combo.blockSignals(False)
+        self.setWindowTitle(f"Bilibili Live Reward · {self.account_combo.currentText()}")
+
     def _account_changed(self, index: int) -> None:
         account_id = self.account_combo.itemData(index)
         if self._is_running or self._closing or not account_id:
@@ -359,24 +377,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
     def add_account(self) -> None:
         if self._is_running or self._closing or self._account_error:
             return
-        name, accepted = QInputDialog.getText(self, "添加账号", "账号备注（1–24 字）\n请先在 B 站 App 切换到要添加的账号，再扫码：")
-        if not accepted:
-            return
-        try:
-            self.add_account_named(name)
-        except (BiliRewardError, ValueError, OSError) as exc:
-            QMessageBox.warning(self, "添加账号失败", str(exc))
-
-    def add_account_named(self, name: str) -> None:
-        if self._is_running or self._closing:
-            raise ValueError("请先停止当前任务，再添加账号")
-        added = self.account_store.add(name)
-        self._account_profiles = self.account_store.list_profiles()
-        self.account_combo.blockSignals(True)
-        self.account_combo.addItem(self._account_display_name(added), added.account_id)
-        self.account_combo.blockSignals(False)
-        self._activate_account(added.account_id)
-        self.start_login()
+        self.start_login(add_account=True)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -615,7 +616,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         self.set_batch_status(self.STATUS_RUNNING, "primary")
         self._start_worker(ClaimWorker(self.service, link_tasks, settings))
 
-    def start_login(self) -> None:
+    def start_login(self, *, add_account: bool = False) -> None:
         if self._is_running or self._closing:
             return
         try:
@@ -624,14 +625,20 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "运行设置无效", str(exc))
             return
-        self._autosave_workspace()
-        self._login_checking = True
+        saved = self._autosave_workspace()
+        if add_account and not self._workspace_error and not saved:
+            QMessageBox.warning(self, "添加账号失败", "当前账号配置未保存，请检查文件写入权限后重试")
+            return
+        self._adding_account = add_account
+        self._login_checking = not add_account
         self._refresh_login_ui()
         self._set_running(True)
-        self.set_batch_status("检查登录中", "primary")
-        self.login_status.setText("正在检查登录…")
-        worker = LoginWorker(self.service, settings)
-        worker.login_checked.connect(self._on_login_checked)
+        self.set_batch_status("添加账号中" if add_account else "检查登录中", "primary")
+        if not add_account:
+            self.login_status.setText("正在检查登录…")
+        worker = LoginWorker(self.service, settings, add_account=add_account)
+        if not add_account:
+            worker.login_checked.connect(self._on_login_checked)
         self._start_worker(worker)
 
     def _on_login_checked(self, success: bool, message: str) -> None:
@@ -667,12 +674,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
             return
         try:
             self.account_store.bind_login(self.service.account_id, self.service.account_identity)
-            self._account_profiles = self.account_store.list_profiles()
-            for profile in self._account_profiles:
-                index = self.account_combo.findData(profile.account_id)
-                self.account_combo.setItemText(index, self._account_display_name(profile))
-                self.account_combo.setItemData(index, profile.name, Qt.ToolTipRole)
-            self.setWindowTitle(f"Bilibili Live Reward · {self.account_combo.currentText()}")
+            self._reload_account_profiles()
         except (BiliRewardError, ValueError, OSError) as exc:
             self.append_ui_log(f"[账号] 登录身份保存失败：{exc}")
 
@@ -715,9 +717,9 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         if (not hasattr(self, "log_filter") or self.log_filter.currentIndex() == 0
                 or task_key is None or task_key == selected_key):
             self.log_text.appendPlainText(message)
-        if "登录状态验证通过" in message:
+        if not self._adding_account and "登录状态验证通过" in message:
             self._on_login_checked(True, "登录已验证")
-        elif "扫码登录成功" in message:
+        elif not self._adding_account and "扫码登录成功" in message:
             self._on_login_checked(False, "扫码完成，验证登录中…")
         if self.qr_dialog and self.qr_dialog.isVisible() and "[登录]" in message:
             self.qr_dialog.set_status_text(message)
@@ -805,7 +807,7 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
         if self.qr_dialog is None:
             self.qr_dialog = QrCodeDialog(self)
             self.qr_dialog.rejected.connect(self.cancel_login)
-        account_name = self.account_combo.currentText()
+        account_name = "添加账号" if self._adding_account else self.account_combo.currentText()
         self.qr_dialog.setWindowTitle(f"{account_name} · 扫码登录")
         self.qr_dialog.set_status_text("请确认手机当前账号，再扫码并确认登录")
         self.qr_dialog.set_qr_code(qr_data.image_bytes, qr_data.login_url)
@@ -834,7 +836,12 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
 
     def on_worker_finished(self) -> None:
         was_login_check = isinstance(self.worker, LoginWorker)
-        self._register_logged_in_account()
+        adding = self._adding_account
+        new_login = self.worker.new_account_login if adding and was_login_check else None
+        cancelled = self.worker._is_login_cancelled() if adding and self.worker else False
+        if not adding:
+            self._register_logged_in_account()
+        self._adding_account = False
         self._set_running(False)
         if was_login_check:
             self.set_batch_status(self.STATUS_IDLE, "dim")
@@ -846,6 +853,20 @@ class MainWindow(TaskWorkspaceMixin, QMainWindow):
             self.qr_dialog.hide()
         self.worker_thread = None
         self.worker = None
+        if adding and new_login and not cancelled and not self._closing:
+            cookies, identity = new_login
+            try:
+                profile = self.account_store.save_login(identity, cookies, preferred_id=self.service.account_id)
+                existed = profile.account_id in {p.account_id for p in self._account_profiles}
+                self._reload_account_profiles()
+                self._activate_account(profile.account_id)
+                self.service.account_identity = identity
+                self._on_login_checked(True, "登录已验证")
+                action = "已更新登录并选中" if existed else "已添加"
+                self.append_ui_log(f"[账号] {action}「{profile.name}」")
+            except (BiliRewardError, ValueError, OSError) as exc:
+                self.append_ui_log(f"[账号] 添加失败：{exc}")
+                QMessageBox.warning(self, "添加账号失败", str(exc))
         self._queue_workspace_save()
         if self._closing:
             self.close()

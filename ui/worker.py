@@ -435,9 +435,11 @@ class LoginWorker(ClaimWorker):
     login_checked = pyqtSignal(bool, str)
 
     def __init__(
-        self, service: RewardService, settings: RunSettings | None = None
+        self, service: RewardService, settings: RunSettings | None = None, *, add_account: bool = False
     ) -> None:
         super().__init__(service, [], settings)
+        self.add_account = add_account
+        self.new_account_login: tuple[dict, dict] | None = None
 
     @pyqtSlot()
     def run(self) -> None:
@@ -446,13 +448,17 @@ class LoginWorker(ClaimWorker):
             # Authentication must work even when the scheduled task's NTP server is down.
             self.service.configure(replace(self.settings, interval_ms=self.settings.global_interval_ms,
                                            retry_mode="count", time_sync_enabled=False))
-            self.service.ensure_login(
+            login = self.service.scan_new_account if self.add_account else self.service.ensure_login
+            result = login(
                 log_callback=self.log_message.emit,
                 qr_callback=lambda qr: self.qr_code_ready.emit(-1, qr),
                 cancel_check=self._is_login_cancelled,
                 timeout=self.settings.timeout,
                 ignore_risk_control=self.settings.ignore_risk_control,
             )
+            self._check_wait_cancelled()
+            if self.add_account:
+                self.new_account_login = result
             self.login_checked.emit(True, "登录已验证")
             self.status_changed.emit("登录就绪")
         except (BiliRewardCancelledError, LoginCancelledError):

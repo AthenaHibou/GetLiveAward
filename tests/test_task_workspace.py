@@ -153,8 +153,9 @@ class WorkspaceTests(unittest.TestCase):
     def test_account_switch_has_independent_task_documents(self):
         window = self.window
         self.fill(window.link_rows[0], "原账号任务", "a")
-        with patch.object(window, "start_login"):
-            window.add_account_named("另一个账号")
+        added = window.account_store.add("另一个账号")
+        window._reload_account_profiles()
+        window._activate_account(added.account_id)
         self.assertEqual(window.link_rows[0].input.text(), "")
         self.fill(window.link_rows[0], "新账号任务", "b")
         window.account_combo.setCurrentIndex(window.account_combo.findData("default"))
